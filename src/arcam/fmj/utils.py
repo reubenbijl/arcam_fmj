@@ -99,7 +99,7 @@ def get_udn_from_xml(xml: Any) -> str | None:
 
 async def get_uniqueid_from_device_description(
     session: aiohttp.ClientSession, url: str
-):
+) -> str | None:
     """Retrieve and extract unique id from url."""
     try:
         async with session.get(url) as req:
@@ -113,7 +113,7 @@ async def get_uniqueid_from_device_description(
         return None
 
 
-async def get_uniqueid_from_host(session: aiohttp.ClientSession, host: str):
+async def get_uniqueid_from_host(session: aiohttp.ClientSession, host: str) -> str | None:
     """Try to deduce a unique id from a host based on ssdp/upnp."""
     return await get_uniqueid_from_device_description(
         session, f"http://{host}:8080/dd.xml"
