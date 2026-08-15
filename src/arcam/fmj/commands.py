@@ -168,7 +168,7 @@ class CommandCodes(IntOrTypeEnum):
     REBOOT                          = 0x26, None
     SETUP                           = 0x27, _HDA
     INPUT_CONFIG                    = 0x28, _HDA
-    GENERAL_SETUP                   = 0x29, _HDA
+    GENERAL_SETUP                   = 0x29, _HDA,      _U
     SPEAKER_TYPES                   = 0x2A, _HDA
     SPEAKER_DISTANCES               = 0x2B, _HDA
     SPEAKER_LEVELS                  = 0x2C, _HDA

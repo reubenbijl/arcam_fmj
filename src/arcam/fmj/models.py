@@ -26,6 +26,16 @@ APIVERSION_SA_SERIES = {
     "SA30",
     "SA750",
 }
+# JBL Synthesis derivatives of the Arcam HDA platform. The SDR-35 AVR and
+# SDP-55 processor (and their SDR-38/SDP-58 revisions) run AVR30/AV40
+# generation firmware and speak the same protocol; see the JBL issue of
+# SH289E ("RS232_SDR35_38_SDP55_58_SH289E_E").
+APIVERSION_JBL_HDA_SERIES = {
+    "SDR-35",
+    "SDR-38",
+    "SDP-55",
+    "SDP-58",
+}
 APIVERSION_HDA_SERIES = {
     "AVR5",
     "AVR10",
@@ -36,8 +46,7 @@ APIVERSION_HDA_SERIES = {
     "AVR21",
     "AVR31",
     "AV41",
-    "SDP-55",
-    "SDP-58",
+    *APIVERSION_JBL_HDA_SERIES,
 }
 APIVERSION_HDA_PREMIUM_SERIES = {
     "AVR10",
@@ -48,8 +57,7 @@ APIVERSION_HDA_PREMIUM_SERIES = {
     "AVR21",
     "AVR31",
     "AV41",
-    "SDP-55",
-    "SDP-58",
+    *APIVERSION_JBL_HDA_SERIES,
 }
 APIVERSION_HDA_MULTI_ZONE_SERIES = {
     "AVR20",
@@ -58,8 +66,7 @@ APIVERSION_HDA_MULTI_ZONE_SERIES = {
     "AVR21",
     "AVR31",
     "AV41",
-    "SDP-55",
-    "SDP-58",
+    *APIVERSION_JBL_HDA_SERIES,
 }
 APIVERSION_PA_SERIES = {
     "PA720",
@@ -92,6 +99,12 @@ APIVERSION_ZONE2_SERIES = {
 APIVERSION_DOLBY_PL_SERIES = APIVERSION_450_SERIES
 
 APIVERSION_AURO_SERIES = APIVERSION_HDA_PREMIUM_SERIES
+
+# The Logic 16 immersive upmixer is exclusive to the JBL Synthesis models.
+# Firmware reports decode mode 0x0B for it — a value SH289E issue E still
+# lists as "Reserved" — and the same document defines the "Logic 16" RC5
+# command (16-114) under Advanced Functions.
+APIVERSION_LOGIC16_SERIES = APIVERSION_JBL_HDA_SERIES
 
 APIVERSION_IMAX_SERIES = {
     *APIVERSION_860_SERIES,

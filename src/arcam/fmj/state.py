@@ -14,6 +14,8 @@ from .codecs import (
     DecodeModeMCH,
     DisplayBrightness,
     DolbyAudioMode,
+    EngineeringMenuInfo,
+    GeneralSetup,
     HdmiOutput,
     IMAX_ENHANCED_SET_MAP,
     ImaxEnhancedMode,
@@ -173,6 +175,7 @@ class State:
             "SUBWOOFER_TRIM": self.get_subwoofer_trim(),
             "SUB_STEREO_TRIM": self.get_sub_stereo_trim(),
             "COMPRESSION": self.get_compression(),
+            "GENERAL_SETUP": self.get_general_setup(),
             "DAB_STATION": self.get_dab_station(),
             "DLS_PDT": self.get_dls_pdt(),
             "RDS_INFORMATION": self.get_rds_information(),
@@ -231,6 +234,13 @@ class State:
             return False
         if cc.version is not None and self.model is not None:
             return self.model in cc.version
+        return True
+
+    def _is_value_supported(self, value: Any) -> bool:
+        """Check per-value model gating (IntOrTypeEnum.version)."""
+        version = getattr(value, "version", None)
+        if version is not None and self.model is not None:
+            return self.model in version
         return True
 
     def _require_command(self, cc: CommandCodes) -> None:
@@ -341,9 +351,11 @@ class State:
         self,
     ) -> list[DecodeModeMCH] | list[DecodeMode2CH] | None:
         if self.get_2ch():
-            return list(RC5CODE_DECODE_MODE_2CH.get((self._api_model, self._zn), {}))
+            modes_2ch = RC5CODE_DECODE_MODE_2CH.get((self._api_model, self._zn), {})
+            return [mode for mode in modes_2ch if self._is_value_supported(mode)]
         else:
-            return list(RC5CODE_DECODE_MODE_MCH.get((self._api_model, self._zn), {}))
+            modes_mch = RC5CODE_DECODE_MODE_MCH.get((self._api_model, self._zn), {})
+            return [mode for mode in modes_mch if self._is_value_supported(mode)]
 
     async def set_decode_mode(self, mode: str | DecodeModeMCH | DecodeMode2CH) -> None:
         if self.get_2ch():
@@ -567,6 +579,35 @@ class State:
     async def dec_balance(self) -> None:
         """Shift balance left."""
         await self._send_rc5(RC5CODE_BALANCE, False)
+
+    def get_general_setup(self) -> GeneralSetup | None:
+        """Return the decoded general-setup block (HDA/JBL series).
+
+        Carries the user-assigned name of the current input plus incoming
+        bitrate/dialnorm and installer settings not available elsewhere.
+        """
+        value = self._state.get(CommandCodes.GENERAL_SETUP)
+        if value is None:
+            return None
+        return GeneralSetup.from_bytes(value)
+
+    async def get_engineering_menu(self) -> EngineeringMenuInfo | None:
+        """Query the engineering menu (region, firmware versions).
+
+        Request-only rather than part of the update loop: the data is
+        static per boot. Decoding only — the writable side of 0x33
+        includes factory reset, which this library does not expose.
+        """
+        try:
+            data = await self._request(
+                self._zn, CommandCodes.ENGINEERING_MENU_INFO, bytes([0xF0])
+            )
+            return EngineeringMenuInfo.from_bytes(data)
+        except UnsupportedCommand:
+            raise
+        except ResponseException as e:
+            _LOGGER.warning("Failed to get engineering menu: %s", e.ac)
+            return None
 
     def get_compression(self) -> CompressionMode | None:
         """Return the dynamic range compression setting."""

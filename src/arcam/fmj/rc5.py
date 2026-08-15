@@ -237,6 +237,9 @@ RC5CODE_DECODE_MODE_2CH: dict[tuple[ApiModel, int], dict[DecodeMode2CH, bytes]] 
         DecodeMode2CH.DTS_NEO_6_MUSIC: bytes([16, 112]),
         DecodeMode2CH.MCH_STEREO: bytes([16, 69]),
         DecodeMode2CH.DTS_NEURAL_X: bytes([16, 113]),
+        # JBL Synthesis models only; State.get_decode_modes filters by the
+        # enum's version gating so Arcam HDA models never offer it.
+        DecodeMode2CH.LOGIC_16_IMMERSION: bytes([16, 114]),
         DecodeMode2CH.DOLBY_VIRTUAL_HEIGHT: bytes([16, 115]),
         DecodeMode2CH.AURO_NATIVE: bytes([16, 103]),
         DecodeMode2CH.AURO_MATIC_3D: bytes([16, 71]),
@@ -266,6 +269,9 @@ RC5CODE_DECODE_MODE_MCH: dict[tuple[ApiModel, int], dict[DecodeModeMCH, bytes]] 
         DecodeModeMCH.MULTI_CHANNEL: bytes([16, 106]),
         DecodeModeMCH.DOLBY_D_EX_OR_DTS_ES: bytes([16, 113]),  # maps to DTS_NEURAL_X
         DecodeModeMCH.DOLBY_SURROUND: bytes([16, 110]),
+        # JBL Synthesis models only; State.get_decode_modes filters by the
+        # enum's version gating so Arcam HDA models never offer it.
+        DecodeModeMCH.LOGIC_16_IMMERSION: bytes([16, 114]),
         DecodeModeMCH.DOLBY_VIRTUAL_HEIGHT: bytes([16, 115]),
         DecodeModeMCH.AURO_NATIVE: bytes([16, 103]),
         DecodeModeMCH.AURO_MATIC_3D: bytes([16, 71]),
