@@ -17,6 +17,7 @@ from .models import (
     APIVERSION_DOLBY_PL_SERIES,
     APIVERSION_HDA_SERIES,
     APIVERSION_IMAX_SERIES,
+    APIVERSION_LOGIC16_SERIES,
     ApiModel,
     IntOrTypeEnum,
 )
@@ -118,7 +119,9 @@ class DecodeMode2CH(IntOrTypeEnum):
 
     Used by DECODE_MODE_STATUS_2CH (0x10). HDA adds Auro modes (0x0E-0x10);
     450 series has Dolby PLIIx variants (0x02/0x03/0x05/0x06) instead of
-    Dolby Surround (0x04).
+    Dolby Surround (0x04). JBL Synthesis models report 0x0B for their
+    exclusive Logic 16 upmixer (listed as "Reserved" in SH289E issue E,
+    observed on SDR-35 firmware).
 
     See: SH289E "Request decode mode status — 2ch (0x10)";
          SH256E "Request decode mode status — 2ch (0x10)".
@@ -135,6 +138,7 @@ class DecodeMode2CH(IntOrTypeEnum):
     MCH_STEREO = 0x09
 
     DTS_NEURAL_X = 0x0A, APIVERSION_AVR_860_ONWARD_SERIES
+    LOGIC_16_IMMERSION = 0x0B, APIVERSION_LOGIC16_SERIES
     DTS_VIRTUAL_X = 0x0C, APIVERSION_AVR_860_ONWARD_SERIES
 
     DOLBY_VIRTUAL_HEIGHT = 0x0D, APIVERSION_HDA_SERIES
@@ -164,6 +168,7 @@ class DecodeModeMCH(IntOrTypeEnum):
     DOLBY_PLII_IIx_MUSIC = 0x05, APIVERSION_DOLBY_PL_SERIES
 
     DOLBY_SURROUND = 0x06, APIVERSION_AVR_860_ONWARD_SERIES
+    LOGIC_16_IMMERSION = 0x0B, APIVERSION_LOGIC16_SERIES
     DTS_VIRTUAL_X = 0x0C, APIVERSION_AVR_860_ONWARD_SERIES
 
     DOLBY_VIRTUAL_HEIGHT = 0x0D, APIVERSION_HDA_SERIES
@@ -650,6 +655,238 @@ SAMPLE_RATE_MAP: dict[int, int | None] = {
     0x07: None,  # Unknown
     0x08: None,  # Undetected
 }
+
+# --- CC 0x29: GENERAL_SETUP ---
+# (Placed after the 0x41-0x44 sections it reuses codecs from.)
+
+#: Wire byte -> incoming bitrate in bits per second, or one of the symbolic
+#: rates "open" / "variable" / "lossless". Data14 of GENERAL_SETUP (0x29).
+#: See: SH289E "General Setup (0x29)".
+INCOMING_BITRATE_MAP: dict[int, int | str] = {
+    0x00: 32_000,
+    0x01: 56_000,
+    0x02: 64_000,
+    0x03: 96_000,
+    0x04: 112_000,
+    0x05: 128_000,
+    0x06: 192_000,
+    0x07: 224_000,
+    0x08: 256_000,
+    0x09: 320_000,
+    0x0A: 384_000,
+    0x0B: 448_000,
+    0x0C: 512_000,
+    0x0D: 576_000,
+    0x0E: 640_000,
+    0x0F: 768_000,
+    0x10: 960_000,
+    0x11: 1_024_000,
+    0x12: 1_152_000,
+    0x13: 1_280_000,
+    0x14: 1_344_000,
+    0x15: 1_408_000,
+    0x16: 1_411_200,
+    0x17: 1_472_000,
+    0x18: 1_536_000,
+    0x19: 1_920_000,
+    0x1A: 2_048_000,
+    0x1B: 3_072_000,
+    0x1C: 3_840_000,
+    0x1D: "open",
+    0x1E: "variable",
+    0x1F: "lossless",
+}
+
+class DisplayOnTime(IntOrTypeEnum):
+    """Front-panel display auto-off time (Data29 of GENERAL_SETUP).
+
+    See: SH289E "General Setup (0x29)".
+    """
+
+    SECONDS_5 = 0x00
+    SECONDS_10 = 0x01
+    SECONDS_30 = 0x02
+    MINUTE_1 = 0x03
+    ALWAYS_ON = 0x04
+
+class ControlOption(IntOrTypeEnum):
+    """External control interface setting (Data30 of GENERAL_SETUP).
+
+    See: SH289E "General Setup (0x29)".
+    """
+
+    OFF = 0x00
+    RS232 = 0x01
+    IP = 0x02
+
+class PowerOnOption(IntOrTypeEnum):
+    """Behaviour after mains power is applied (Data31 of GENERAL_SETUP).
+
+    See: SH289E "General Setup (0x29)".
+    """
+
+    LAST_STATE = 0x00
+    STANDBY = 0x01
+    ON = 0x02
+
+class MenuLanguage(IntOrTypeEnum):
+    """On-screen menu language (Data32 of GENERAL_SETUP).
+
+    See: SH289E "General Setup (0x29)".
+    """
+
+    ENGLISH = 0x00
+    FRENCH = 0x01
+    GERMAN = 0x02
+    SPANISH = 0x03
+    DUTCH = 0x04
+    RUSSIAN = 0x05
+    CHINESE = 0x06
+
+def _decode_offset_binary(value: int) -> int:
+    """Decode a sign-and-magnitude byte (0x81-0xFF encode -1 downward)."""
+    if value >= 0x81:
+        return -(value - 0x80)
+    return value
+
+@attr.s
+class GeneralSetup:
+    """Decoded response for GENERAL_SETUP (0x29), HDA/JBL series.
+
+    A 32-byte snapshot of the General Setup menu combined with incoming
+    stream information: the user-assigned name of the current input,
+    detected audio format/config/rate/bitrate/dialnorm, detected video
+    mode, and a handful of installer settings.
+
+    ``bitrate`` is bits per second, or one of the symbolic strings
+    "open"/"variable"/"lossless"; ``dialnorm`` is dB (0-31), None when
+    out of the documented range (no stream); ``balance`` and
+    ``dts_dialogue_control`` follow the documented 0-6 ranges with
+    balance negative meaning left.
+
+    See: SH289E "General Setup (0x29)" (JBL issue documents the same
+    layout for SDR-35/SDR-38/SDP-55/SDP-58).
+    """
+
+    source_name = attr.ib(type=str)
+    audio_format = attr.ib(type=IncomingAudioFormat)
+    audio_config = attr.ib(type=IncomingAudioConfig)
+    sample_rate = attr.ib(type=int | None)
+    bitrate = attr.ib(type=int | str | None)
+    dialnorm = attr.ib(type=int | None)
+    horizontal_resolution = attr.ib(type=int)
+    vertical_resolution = attr.ib(type=int)
+    refresh_rate = attr.ib(type=int)
+    interlaced = attr.ib(type=bool)
+    aspect_ratio = attr.ib(type=IncomingVideoAspectRatio)
+    colorspace = attr.ib(type=IncomingVideoColorspace)
+    compression = attr.ib(type=CompressionMode)
+    balance = attr.ib(type=int)
+    dts_dialogue_control = attr.ib(type=int)
+    max_volume = attr.ib(type=int)
+    max_on_volume = attr.ib(type=int)
+    display_on_time = attr.ib(type=DisplayOnTime)
+    control_option = attr.ib(type=ControlOption)
+    power_on_option = attr.ib(type=PowerOnOption)
+    language = attr.ib(type=MenuLanguage)
+
+    @staticmethod
+    def from_bytes(data: bytes) -> "GeneralSetup":
+        if len(data) < 32:
+            raise ValueError(f"General setup data too short {data!r}")
+        return GeneralSetup(
+            source_name=data[0:10].decode("ascii", errors="replace").rstrip("\x00").strip(),
+            audio_format=IncomingAudioFormat.from_int(data[10]),
+            audio_config=IncomingAudioConfig.from_int(data[11]),
+            sample_rate=SAMPLE_RATE_MAP.get(data[12]),
+            bitrate=INCOMING_BITRATE_MAP.get(data[13]),
+            dialnorm=data[14] if data[14] <= 0x1F else None,
+            horizontal_resolution=int.from_bytes(data[15:17], "big"),
+            vertical_resolution=int.from_bytes(data[17:19], "big"),
+            refresh_rate=data[19],
+            interlaced=(data[20] == 0x01),
+            aspect_ratio=IncomingVideoAspectRatio.from_int(data[21]),
+            colorspace=IncomingVideoColorspace.from_int(data[22]),
+            compression=CompressionMode.from_int(data[23]),
+            balance=_decode_offset_binary(data[24]),
+            dts_dialogue_control=data[25],
+            max_volume=data[26],
+            max_on_volume=data[27],
+            display_on_time=DisplayOnTime.from_int(data[28]),
+            control_option=ControlOption.from_int(data[29]),
+            power_on_option=PowerOnOption.from_int(data[30]),
+            language=MenuLanguage.from_int(data[31]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {field.name: getattr(self, field.name) for field in attr.fields(GeneralSetup)}
+
+# --- CC 0x33: ENGINEERING_MENU_INFO ---
+
+class DeviceRegion(IntOrTypeEnum):
+    """Sales-region setting (Data11 of ENGINEERING_MENU_INFO).
+
+    See: SH289E "Engineering menu (0x33)".
+    """
+
+    EUROPE = 0x00
+    US = 0x01
+    CANADA = 0x02
+    AUSTRALIA = 0x03
+    CHINA = 0x04
+
+@attr.s
+class EngineeringMenuInfo:
+    """Decoded response for ENGINEERING_MENU_INFO (0x33), HDA/JBL series.
+
+    Read-only view of the engineering menu: region, remote-code set,
+    standby mode, protection status and the various firmware versions.
+    The command is also writable on the wire but the writable fields
+    include factory reset, so this library deliberately only decodes.
+
+    Field lengths follow SH289E; the trailing version strings are decoded
+    defensively since observed responses vary in length between firmware
+    revisions.
+
+    See: SH289E "Engineering menu (0x33)".
+    """
+
+    region = attr.ib(type=DeviceRegion)
+    remote_code = attr.ib(type=int)
+    standby_mode = attr.ib(type=int)
+    protection_sensitivity = attr.ib(type=int)
+    dante_enabled = attr.ib(type=bool)
+    c4_sddp_enabled = attr.ib(type=bool)
+    shutdown_code = attr.ib(type=int)
+    host_version = attr.ib(type=str)
+    dsp_version = attr.ib(type=str)
+    osd_version = attr.ib(type=str)
+    net_version = attr.ib(type=str)
+
+    @staticmethod
+    def _version(data: bytes, start: int, end: int) -> str:
+        return data[start:end].decode("ascii", errors="replace").rstrip("\x00").strip()
+
+    @staticmethod
+    def from_bytes(data: bytes) -> "EngineeringMenuInfo":
+        if len(data) < 20:
+            raise ValueError(f"Engineering menu data too short {data!r}")
+        return EngineeringMenuInfo(
+            region=DeviceRegion.from_int(data[10]),
+            remote_code=data[11],
+            standby_mode=data[12],
+            protection_sensitivity=data[13],
+            dante_enabled=(data[16] == 0x01),
+            c4_sddp_enabled=(data[17] == 0x01),
+            shutdown_code=data[19],
+            host_version=EngineeringMenuInfo._version(data, 20, 29),
+            dsp_version=EngineeringMenuInfo._version(data, 29, 33),
+            osd_version=EngineeringMenuInfo._version(data, 33, 37),
+            net_version=EngineeringMenuInfo._version(data, 37, 51),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {field.name: getattr(self, field.name) for field in attr.fields(EngineeringMenuInfo)}
 
 # --- CC 0x4F: VIDEO_OUTPUT_SWITCHING ---
 
