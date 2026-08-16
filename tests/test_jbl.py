@@ -213,3 +213,19 @@ async def test_engineering_menu_short_response():
 async def test_engineering_menu_too_short():
     with pytest.raises(ValueError):
         EngineeringMenuInfo.from_bytes(ENGINEERING_MENU_DATA[:19])
+
+
+async def test_multichannel_pcm_is_not_2ch():
+    """7.1 PCM must use the multi-channel decode modes.
+
+    Observed on an SDR-35: with multi-channel PCM playing, the 2ch decode
+    query answers 0x85 (invalid at this time) while the MCH query answers.
+    """
+    state = make_state("SDR-35")
+    state._state[CommandCodes.INCOMING_AUDIO_FORMAT] = bytes([0x00, 0x1C])
+    assert not state.get_2ch()
+    state._state[CommandCodes.INCOMING_AUDIO_FORMAT] = bytes([0x00, 0x02])
+    assert state.get_2ch()
+    # An undetected configuration keeps the historical format-based answer.
+    state._state[CommandCodes.INCOMING_AUDIO_FORMAT] = bytes([0x00, 0x21])
+    assert state.get_2ch()

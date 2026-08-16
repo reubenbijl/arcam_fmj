@@ -95,6 +95,23 @@ from .utils import run_tasks, wait_any
 _LOGGER = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
+#: Channel configurations carrying at most two main channels; anything else
+#: means a PCM or analogue stream is multi-channel despite its format byte.
+_TWO_CHANNEL_CONFIGS = {
+    IncomingAudioConfig.DUAL_MONO,
+    IncomingAudioConfig.MONO,  # same value as CENTER_ONLY
+    IncomingAudioConfig.STEREO_ONLY,
+    IncomingAudioConfig.STEREO_DOWNMIX,
+    IncomingAudioConfig.STEREO_ONLY_LO_RO,
+    IncomingAudioConfig.DUAL_MONO_LFE,
+    IncomingAudioConfig.MONO_LFE,  # same value as CENTER_LFE
+    IncomingAudioConfig.STEREO_LFE,
+    IncomingAudioConfig.STEREO_DOWNMIX_LFE,
+    IncomingAudioConfig.STEREO_ONLY_LO_RO_LFE,
+    IncomingAudioConfig.UNKNOWN,
+    IncomingAudioConfig.UNDETECTED,
+}
+
 
 
 def _get_scaled_negative(data: bytes | None, min_value: float, max_value: float, scale: float) -> float | None:
@@ -330,16 +347,18 @@ class State:
 
     def get_2ch(self) -> bool:
         """Return if source is 2 channel or not."""
-        audio_format, _ = self.get_incoming_audio_format()
-        return bool(
-            audio_format
-            in (
-                IncomingAudioFormat.PCM,
-                IncomingAudioFormat.ANALOGUE_DIRECT,
-                IncomingAudioFormat.UNDETECTED,
-                None,
-            )
-        )
+        audio_format, audio_config = self.get_incoming_audio_format()
+        if audio_format not in (
+            IncomingAudioFormat.PCM,
+            IncomingAudioFormat.ANALOGUE_DIRECT,
+            IncomingAudioFormat.UNDETECTED,
+            None,
+        ):
+            return False
+        # Multi-channel PCM exists (observed on an SDR-35 playing 7.1 PCM: the
+        # 2ch decode query answers 0x85 while the MCH one answers normally), so
+        # use the channel configuration to catch it when the device reports one.
+        return audio_config is None or audio_config in _TWO_CHANNEL_CONFIGS
 
     def get_decode_mode(self) -> DecodeModeMCH | DecodeMode2CH | None:
         if self.get_2ch():
