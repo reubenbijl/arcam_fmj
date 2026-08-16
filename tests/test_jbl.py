@@ -229,3 +229,35 @@ async def test_multichannel_pcm_is_not_2ch():
     # An undetected configuration keeps the historical format-based answer.
     state._state[CommandCodes.INCOMING_AUDIO_FORMAT] = bytes([0x00, 0x21])
     assert state.get_2ch()
+
+
+@pytest.mark.parametrize(
+    ("mute", "status", "confirmed"),
+    [
+        (True, bytes([0x00]), True),
+        (False, bytes([0x01]), True),
+        (True, bytes([0x01]), False),
+    ],
+)
+async def test_mute_rc5_without_echo(mute, status, confirmed):
+    """Mute must not fail when only the status push answers.
+
+    Observed on an SDR-35: the discrete mute RC5 codes are executed but the
+    0x08 frame is never echoed, so the request times out while the 0x0E
+    status arrives as a push.
+    """
+    state = make_state("SDR-35")
+
+    async def request(zn, cc, data, priority=0):
+        if cc == CommandCodes.SIMULATE_RC5_IR_COMMAND:
+            raise TimeoutError
+        assert cc == CommandCodes.MUTE
+        return status
+
+    state.client.request.side_effect = request
+    if confirmed:
+        await state.set_mute(mute)
+        assert state.get_mute() is mute
+    else:
+        with pytest.raises(TimeoutError):
+            await state.set_mute(mute)

@@ -436,7 +436,18 @@ class State:
             bool_to_hex = 0x00 if mute else 0x01
             await self._request(self._zn, CommandCodes.MUTE, bytes([bool_to_hex]))
         else:
-            await self._send_rc5(RC5CODE_MUTE, mute)
+            try:
+                await self._send_rc5(RC5CODE_MUTE, mute)
+            except TimeoutError:
+                # The SDR-35 (and possibly other HDA units) never echoes the
+                # 0x08 frame for the discrete mute codes; it only pushes the
+                # new 0x0E status, observed about 0.6s after the command.
+                # Confirm the state landed before failing a command that in
+                # fact worked.
+                data = await self._request(self._zn, CommandCodes.MUTE, bytes([0xF0]))
+                self._state[CommandCodes.MUTE] = data
+                if (int.from_bytes(data, "big") == 0) != mute:
+                    raise
 
     def get_headphones(self) -> bool | None:
         """Return whether headphones are connected."""
