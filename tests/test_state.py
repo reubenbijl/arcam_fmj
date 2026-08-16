@@ -123,7 +123,9 @@ async def test_power_off(zn, api_model):
     else:
         # zn, api_model, power
         code = PARAMS_TO_RC5COMMAND[zn, api_model, False]
-        client.request.assert_called_with(zn, CommandCodes.SIMULATE_RC5_IR_COMMAND, code)
+        client.request.assert_called_with(
+            zn, CommandCodes.SIMULATE_RC5_IR_COMMAND, code, 0
+        )
     assert state.get_power() is False
 
 

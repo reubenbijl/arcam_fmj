@@ -261,3 +261,58 @@ async def test_mute_rc5_without_echo(mute, status, confirmed):
     else:
         with pytest.raises(TimeoutError):
             await state.set_mute(mute)
+
+
+@pytest.mark.parametrize(
+    ("action", "cc", "status", "confirmed"),
+    [
+        (
+            lambda s: s.set_source(SourceCodes.CD),
+            CommandCodes.CURRENT_SOURCE,
+            bytes([0x01]),
+            True,
+        ),
+        (
+            lambda s: s.set_source(SourceCodes.CD),
+            CommandCodes.CURRENT_SOURCE,
+            bytes([0x02]),
+            False,
+        ),
+        (
+            lambda s: s.set_decode_mode_mch(DecodeModeMCH.LOGIC_16_IMMERSION),
+            CommandCodes.DECODE_MODE_STATUS_MCH,
+            bytes([0x0B]),
+            True,
+        ),
+        (
+            lambda s: s.set_decode_mode_2ch(DecodeMode2CH.STEREO),
+            CommandCodes.DECODE_MODE_STATUS_2CH,
+            bytes([0x01]),
+            True,
+        ),
+        (lambda s: s.set_power(True), CommandCodes.POWER, bytes([0x01]), True),
+        (lambda s: s.set_power(False), CommandCodes.POWER, bytes([0x00]), True),
+    ],
+)
+async def test_rc5_commands_without_echo(action, cc, status, confirmed):
+    """RC5-simulated commands must not fail when only the status push answers.
+
+    Same firmware behaviour as mute, observed on an SDR-35 for input
+    selection as well: the command executes but the 0x08 frame is never
+    echoed.
+    """
+    state = make_state("SDR-35")
+
+    async def request(zn, command, data, priority=0):
+        if command == CommandCodes.SIMULATE_RC5_IR_COMMAND:
+            raise TimeoutError
+        assert command == cc
+        return status
+
+    state.client.request.side_effect = request
+    if confirmed:
+        await action(state)
+        assert state._state[cc] == status
+    else:
+        with pytest.raises(TimeoutError):
+            await action(state)

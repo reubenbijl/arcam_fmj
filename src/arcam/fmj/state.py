@@ -328,6 +328,25 @@ class State:
             self._zn, CommandCodes.SIMULATE_RC5_IR_COMMAND, command
         )
 
+    async def _send_rc5_expecting(
+        self, table: dict, value, cc: CommandCodes, expected: bytes
+    ) -> None:
+        """Send an RC5 command, tolerating firmware that skips the 0x08 echo.
+
+        The SDR-35 executes several RC5 codes (mute, source, decode mode,
+        power) without echoing the simulate-IR frame; only the resulting
+        status push follows, observed well under a second later. On timeout,
+        confirm the target state actually landed before failing a command
+        that in fact worked.
+        """
+        try:
+            await self._send_rc5(table, value)
+        except TimeoutError:
+            data = await self._request(self._zn, cc, bytes([0xF0]))
+            self._state[cc] = data
+            if data != expected:
+                raise
+
     def get(self, cc):
         return self._state[cc]
 
@@ -361,7 +380,12 @@ class State:
         return DecodeMode2CH.from_int(value)
 
     async def set_decode_mode_2ch(self, mode: DecodeMode2CH) -> None:
-        await self._send_rc5(RC5CODE_DECODE_MODE_2CH, mode)
+        await self._send_rc5_expecting(
+            RC5CODE_DECODE_MODE_2CH,
+            mode,
+            CommandCodes.DECODE_MODE_STATUS_2CH,
+            bytes([int(mode)]),
+        )
 
     def get_decode_mode_mch(self) -> DecodeModeMCH | None:
         value = _get_byte(self._state.get(CommandCodes.DECODE_MODE_STATUS_MCH))
@@ -370,7 +394,12 @@ class State:
         return DecodeModeMCH.from_int(value)
 
     async def set_decode_mode_mch(self, mode: DecodeModeMCH) -> None:
-        await self._send_rc5(RC5CODE_DECODE_MODE_MCH, mode)
+        await self._send_rc5_expecting(
+            RC5CODE_DECODE_MODE_MCH,
+            mode,
+            CommandCodes.DECODE_MODE_STATUS_MCH,
+            bytes([int(mode)]),
+        )
 
     def get_2ch(self) -> bool:
         """Return if source is 2 channel or not."""
@@ -434,16 +463,17 @@ class State:
             await self._request(self._zn, CommandCodes.POWER, bytes([bool_to_hex]))
         else:
             if power:
-                await self._send_rc5(RC5CODE_POWER, power)
+                await self._send_rc5_expecting(
+                    RC5CODE_POWER, power, CommandCodes.POWER, bytes([0x01])
+                )
             else:
-                command = self.get_rc5code(RC5CODE_POWER, power)
                 # seed with a response, since device might not
                 # respond in timely fashion, so let's just
                 # assume we succeded until response come
                 # back.
                 self._state[CommandCodes.POWER] = bytes([0])
-                await self._client.request(
-                    self._zn, CommandCodes.SIMULATE_RC5_IR_COMMAND, command
+                await self._send_rc5_expecting(
+                    RC5CODE_POWER, power, CommandCodes.POWER, bytes([0x00])
                 )
 
     def get_menu(self) -> MenuCodes | None:
@@ -463,18 +493,12 @@ class State:
             bool_to_hex = 0x00 if mute else 0x01
             await self._request(self._zn, CommandCodes.MUTE, bytes([bool_to_hex]))
         else:
-            try:
-                await self._send_rc5(RC5CODE_MUTE, mute)
-            except TimeoutError:
-                # The SDR-35 (and possibly other HDA units) never echoes the
-                # 0x08 frame for the discrete mute codes; it only pushes the
-                # new 0x0E status, observed about 0.6s after the command.
-                # Confirm the state landed before failing a command that in
-                # fact worked.
-                data = await self._request(self._zn, CommandCodes.MUTE, bytes([0xF0]))
-                self._state[CommandCodes.MUTE] = data
-                if (int.from_bytes(data, "big") == 0) != mute:
-                    raise
+            await self._send_rc5_expecting(
+                RC5CODE_MUTE,
+                mute,
+                CommandCodes.MUTE,
+                bytes([0x00]) if mute else bytes([0x01]),
+            )
 
     def get_headphones(self) -> bool | None:
         """Return whether headphones are connected."""
@@ -730,7 +754,12 @@ class State:
             value = src.to_bytes(self._api_model, self._zn)
             await self._request(self._zn, CommandCodes.CURRENT_SOURCE, value)
         else:
-            await self._send_rc5(RC5CODE_SOURCE, src)
+            await self._send_rc5_expecting(
+                RC5CODE_SOURCE,
+                src,
+                CommandCodes.CURRENT_SOURCE,
+                src.to_bytes(self._api_model, self._zn),
+            )
 
     def get_volume(self) -> int | None:
         return _get_byte(self._state.get(CommandCodes.VOLUME))
