@@ -1178,6 +1178,48 @@ async def test_update_presets_ignores_empty_payload():
     assert state._presets == {}
 
 
+async def test_update_fetches_room_eq_names_once_per_connection():
+    """ROOM_EQ_NAMES is static per connection; polling it every pass was the
+    single largest source of request traffic."""
+    client = MagicMock(spec=Client)
+    client.connected = True
+    client.request.return_value = b"\x01name"
+    state = State(client, 1)
+    state._amxduet = AmxDuetResponse({"Device-Model": "SDR-35"})
+
+    await asyncio.gather(*await state.get_update_tasks())
+    first = [call.args[1] for call in client.request.call_args_list]
+    assert CommandCodes.ROOM_EQ_NAMES in first
+
+    client.request.reset_mock()
+    await asyncio.gather(*await state.get_update_tasks())
+    second = [call.args[1] for call in client.request.call_args_list]
+    assert CommandCodes.ROOM_EQ_NAMES not in second
+
+
+async def test_room_eq_names_refetched_after_reconnect():
+    """Disconnecting clears _state, so the next pass asks again."""
+    client = MagicMock(spec=Client)
+    client.connected = True
+    client.request.return_value = b"\x01name"
+    state = State(client, 1)
+    state._amxduet = AmxDuetResponse({"Device-Model": "SDR-35"})
+
+    await asyncio.gather(*await state.get_update_tasks())
+    assert CommandCodes.ROOM_EQ_NAMES in state._state
+
+    # a disconnected pass wipes the cached state
+    client.connected = False
+    assert await state.get_update_tasks() == []
+    assert CommandCodes.ROOM_EQ_NAMES not in state._state
+
+    client.connected = True
+    client.request.reset_mock()
+    await asyncio.gather(*await state.get_update_tasks())
+    refetched = [call.args[1] for call in client.request.call_args_list]
+    assert CommandCodes.ROOM_EQ_NAMES in refetched
+
+
 async def test_update_records_command_not_recognised():
     """update() should record COMMAND_NOT_RECOGNISED in the runtime blocklist."""
     from arcam.fmj.errors import CommandNotRecognised
