@@ -61,7 +61,12 @@ def async_retry(attempts=2, allowed_exceptions=()):
                 except allowed_exceptions:
                     if attempt == 0:
                         raise
-                    _LOGGER.warning("Retrying: %s %s", f, args)
+                    # Debug, not warning: a retry that then succeeds is a
+                    # routine slow response, not a fault, and the caller
+                    # logs the give-up case itself. Logging `args` here also
+                    # dragged in the repr of the client, the StreamWriter and
+                    # its transport - about 500 characters a line.
+                    _LOGGER.debug("Retrying %s", getattr(f, "__name__", f))
 
         return wrapper
 

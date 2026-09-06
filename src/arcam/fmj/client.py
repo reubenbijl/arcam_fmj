@@ -32,7 +32,13 @@ from .utils import async_retry, cancel_and_wait, run_tasks
 
 _LOGGER = logging.getLogger(__name__)
 
-_REQUEST_TIMEOUT = timedelta(milliseconds=500)
+# 1.2s, not 500ms: the SDR-35 answers some requests just over half a second,
+# and never echoes the 0x08 frame for RC5-simulated commands at all - only a
+# status push about 0.6s later. At 500ms those all timed out and were re-sent
+# by @async_retry, which cost two transmissions and ~1.1s to get an answer a
+# single longer wait gets in one. Slower than the old worst case only when the
+# device is genuinely unresponsive.
+_REQUEST_TIMEOUT = timedelta(milliseconds=1200)
 _REQUEST_RETRY_COUNT = 2
 _REQUEST_SETTLE_TIME = timedelta(milliseconds=5)
 

@@ -880,7 +880,10 @@ class State:
                 _LOGGER.debug("Not connected skipping %s", cc)
                 self._state[cc] = None
             except TimeoutError:
-                _LOGGER.error("Timeout requesting %s", cc)
+                # Debug, like every other handler in this block: a slow or
+                # sleeping device is expected, and the value is simply left
+                # stale until the next pass.
+                _LOGGER.debug("Timeout requesting %s", cc)
 
         async def _update_presets() -> None:
             presets = {}
@@ -900,7 +903,7 @@ class State:
                     _LOGGER.debug("Not connected skipping preset %s", preset)
                     return
                 except TimeoutError:
-                    _LOGGER.error("Timeout requesting preset %s", preset)
+                    _LOGGER.debug("Timeout requesting preset %s", preset)
                     return
             self._presets = presets
 
@@ -927,7 +930,7 @@ class State:
                 except ResponseException as e:
                     _LOGGER.debug("Now playing %s error: %s", field.name, e.ac)
                 except TimeoutError:
-                    _LOGGER.error("Timeout requesting now playing %s", field.name)
+                    _LOGGER.debug("Timeout requesting now playing %s", field.name)
 
             if kwargs:
                 self._now_playing = NowPlayingInfo(**kwargs)
@@ -943,7 +946,7 @@ class State:
             except NotConnectedException as e:
                 _LOGGER.debug("Not connected skipping amx")
             except TimeoutError:
-                _LOGGER.error("Timeout requesting amx")
+                _LOGGER.debug("Timeout requesting amx")
 
         if not self._client.connected:
             if self._state:
@@ -965,6 +968,14 @@ class State:
                 tasks.append(_update_now_playing())
             elif cc == CommandCodes.PRESET_DETAIL:
                 tasks.append(_update_presets())
+            elif cc == CommandCodes.ROOM_EQ_NAMES:
+                # Static for the life of a connection, and by far the single
+                # largest source of request traffic when polled every pass.
+                # Any settled verdict - data, or None for not-recognised -
+                # is enough; a timeout leaves the key absent and retries.
+                # _state is cleared on disconnect, so this refetches then.
+                if cc not in self._state:
+                    tasks.append(_update(cc))
             else:
                 tasks.append(_update(cc))
 
