@@ -126,6 +126,7 @@ _POLL_FAST_COMMANDS = frozenset({
 _TUNER_SOURCES = frozenset({SourceCodes.FM, SourceCodes.DAB})
 _NETWORK_SOURCES = frozenset({SourceCodes.NET, SourceCodes.USB, SourceCodes.NET_USB})
 _BLUETOOTH_SOURCES = frozenset({SourceCodes.BT})
+_NOW_PLAYING_SOURCES = _NETWORK_SOURCES | _BLUETOOTH_SOURCES
 
 #: Commands the device only answers (else 0x85) while one of these sources
 #: is selected.  Skipped otherwise, and their cached state is dropped when
@@ -137,9 +138,30 @@ _POLL_SOURCE_COMMANDS: dict[CommandCodes, frozenset[SourceCodes]] = {
     CommandCodes.DAB_STATION: frozenset({SourceCodes.DAB}),
     CommandCodes.DLS_PDT_INFO: frozenset({SourceCodes.DAB}),
     CommandCodes.NETWORK_PLAYBACK_STATUS: _NETWORK_SOURCES,
-    CommandCodes.NOW_PLAYING_INFO: _NETWORK_SOURCES,
+    CommandCodes.NOW_PLAYING_INFO: _NOW_PLAYING_SOURCES,
     CommandCodes.BLUETOOTH_STATUS: _BLUETOOTH_SOURCES,
 }
+
+
+def _strip_now_playing_echo(request: int, data: bytes) -> bytes:
+    """Remove the sub-request byte newer firmware echoes ahead of the payload.
+
+    Older firmware sends the payload alone.  The request bytes 0xF0-0xF4 are
+    also valid UTF-8 lead bytes, so comparing the first byte alone would eat
+    the leading character of a title that starts with an emoji.
+
+    A payload is either UTF-8 text or a single small enum byte, so its first
+    byte is never a UTF-8 continuation byte -- meaning an echo byte followed
+    by a payload never decodes as UTF-8, while a genuine 4-byte character
+    always does.  Strip only when the whole thing fails to decode.
+    """
+    if data[:1] != bytes([request]):
+        return data
+    try:
+        data.decode("utf8")
+    except UnicodeDecodeError:
+        return data[1:]
+    return data
 
 # --- Source selection ---
 #
@@ -345,7 +367,12 @@ class State:
         )
 
     async def _write(self, cc: CommandCodes, data: bytes) -> bytes:
-        """Write a value and cache the device's echo of the new value."""
+        """Write a value and cache the device's echo of the new value.
+
+        Once the State is started, ``_listen`` caches every status reply as
+        well; storing here too keeps writes coherent before ``start()`` and
+        for callers that use a State without registering it on the client.
+        """
         response = await self._request(self._zn, cc, data)
         self._state[cc] = response
         return response
@@ -967,8 +994,13 @@ class State:
                     _LOGGER.error("Timeout requesting preset %s", preset)
                     return
             self._presets = presets
-            self._presets_source = source
-            self._presets_stale = False
+            # A 0x85 on the very first slot cannot be told apart from "tuner
+            # not ready yet" (e.g. mid source switch), so only treat the list
+            # as fresh once at least one preset came back; otherwise the next
+            # source tick retries.
+            if presets:
+                self._presets_source = source
+                self._presets_stale = False
 
         async def _update_now_playing() -> None:
             kwargs = {}
@@ -982,11 +1014,14 @@ class State:
                     )
                     # Newer firmware (JBL SDR/SDP, Arcam HDA from ~1.42) echoes
                     # the sub-request byte as Data1 before the payload; older
-                    # firmware sends the payload alone.  Strip the echo so the
-                    # converters see only the payload.
-                    if data[:1] == bytes([request]):
-                        data = data[1:]
-                    kwargs[field.name] = field.metadata["converter"](data)
+                    # firmware sends the payload alone.
+                    data = _strip_now_playing_echo(request, data)
+                    if not data:
+                        continue  # nothing playing: leave the field None
+                    try:
+                        kwargs[field.name] = field.metadata["converter"](data)
+                    except (IndexError, ValueError) as e:
+                        _LOGGER.debug("Now playing %s undecodable %r: %s", field.name, data, e)
                 except CommandNotRecognised:
                     _LOGGER.debug("Now playing not supported")
                     self._now_playing = None
@@ -1057,7 +1092,13 @@ class State:
         return tasks
 
     def _drop_source_state(self, source: SourceCodes | None) -> None:
-        """Forget cached info that only applies to sources other than ``source``."""
+        """Forget cached info that only applies to sources other than ``source``.
+
+        An unknown source (``None``) or a zone following zone 1 drops nothing,
+        since either could be on any source.
+        """
+        if source is None or source == SourceCodes.FOLLOW_ZONE_1:
+            return
         for cc, sources in _POLL_SOURCE_COMMANDS.items():
             if source in sources:
                 continue
@@ -1080,9 +1121,13 @@ class State:
         now = time.monotonic()
         power = self.get_power()
         source = self.get_source()
+        if source == SourceCodes.FOLLOW_ZONE_1:
+            # Zone 2 mirroring zone 1: we do not know the real source here,
+            # so treat it as unknown and keep polling source items permissively.
+            source = None
 
-        if power and not self._poll_power:
-            # Came out of standby (or first sight of it on): refresh everything.
+        if power and self._poll_power is False:
+            # Came out of standby: refresh everything.
             self._poll_due = {"fast": 0.0, "source": 0.0, "slow": 0.0}
         if source != self._poll_source:
             self._poll_due["source"] = 0.0

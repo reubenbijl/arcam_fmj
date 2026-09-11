@@ -26,7 +26,10 @@ MODEL_FOR_API = {
 
 _HDA_SOURCE = {
     src: src.to_bytes(ApiModel.APIHDA_SERIES, 1)
-    for src in (SourceCodes.BD, SourceCodes.FM, SourceCodes.DAB, SourceCodes.NET, SourceCodes.BT)
+    for src in (
+        SourceCodes.BD, SourceCodes.FM, SourceCodes.DAB, SourceCodes.NET,
+        SourceCodes.BT, SourceCodes.FOLLOW_ZONE_1,
+    )
 }
 
 
@@ -134,8 +137,9 @@ async def test_power_on_brings_every_tier_forward():
      {CommandCodes.NETWORK_PLAYBACK_STATUS, CommandCodes.NOW_PLAYING_INFO},
      {CommandCodes.RDS_INFORMATION, CommandCodes.BLUETOOTH_STATUS}),
     (SourceCodes.BT,
-     {CommandCodes.BLUETOOTH_STATUS},
-     {CommandCodes.NOW_PLAYING_INFO, CommandCodes.RDS_INFORMATION}),
+     # 0x64 carries track metadata for Bluetooth as well as network sources.
+     {CommandCodes.BLUETOOTH_STATUS, CommandCodes.NOW_PLAYING_INFO},
+     {CommandCodes.RDS_INFORMATION, CommandCodes.NETWORK_PLAYBACK_STATUS}),
 ])
 async def test_source_specific_commands_follow_the_source(source, expected, unexpected):
     _, state = make_state()
@@ -361,3 +365,122 @@ async def test_set_tone_caches_echoed_value():
     await state.set_balance(-5)
     client.request.assert_called_once_with(1, CommandCodes.BALANCE, bytes([0x85]), 0)
     assert state.get_balance() == -5.0
+
+
+# --- Regressions found in review ---
+
+
+async def test_presets_retry_after_transient_error():
+    """A 0x85 on the first slot means 'tuner not ready', not 'no presets'."""
+    client, state = make_state()
+    ready = False
+
+    async def request(zn, cc, data, priority=0):
+        if cc == CommandCodes.PRESET_DETAIL:
+            if ready and data == b"\x01":
+                return b"\x01\x03SR P1"
+            raise CommandInvalidAtThisTime()
+        raise CommandInvalidAtThisTime()
+
+    client.request.side_effect = request
+    await requested(state)
+    _set(state, power=True, source=SourceCodes.FM)
+    state._poll_power = True
+
+    assert CommandCodes.PRESET_DETAIL in await requested(state)
+    assert state.get_preset_details() == {}
+    assert state._presets_stale is True  # not cached as a known-empty list
+
+    ready = True
+    state._poll_due["source"] = 0.0
+    assert CommandCodes.PRESET_DETAIL in await requested(state)
+    assert state.get_preset_details()[1].name == "SR P1"
+
+
+async def test_now_playing_keeps_leading_emoji_on_old_firmware():
+    """0xF0-0xF4 are UTF-8 lead bytes; a real title must not lose one."""
+    client, state = make_state()
+
+    async def request(zn, cc, data, priority=0):
+        if cc != CommandCodes.NOW_PLAYING_INFO:
+            raise CommandInvalidAtThisTime()
+        return {
+            0xF0: "\N{MUSICAL NOTE} Song".encode(),      # old firmware, no echo
+            0xF1: "\N{SNOWMAN} Band".encode(),
+            0xF2: b"\xf2Album",                          # new firmware, echoed
+            0xF3: b"",
+            0xF4: b"\x01",
+            0xF5: b"\xf5\x03",
+        }[data[0]]
+
+    client.request.side_effect = request
+    _set(state, power=True, source=SourceCodes.NET)
+    await asyncio.gather(*await state.get_update_tasks())
+
+    info = state.get_now_playing()
+    assert info.track == "\N{MUSICAL NOTE} Song"
+    assert info.artist == "\N{SNOWMAN} Band"
+    assert info.album == "Album"
+    assert info.sample_rate == 44100
+    assert info.encoder.name == "FLAC"
+
+
+async def test_now_playing_echo_only_response_is_survivable():
+    """Nothing playing: an echo with no payload must not raise."""
+    client, state = make_state()
+
+    async def request(zn, cc, data, priority=0):
+        if cc != CommandCodes.NOW_PLAYING_INFO:
+            raise CommandInvalidAtThisTime()
+        return bytes([data[0]])  # echo only
+
+    client.request.side_effect = request
+    _set(state, power=True, source=SourceCodes.NET)
+    await asyncio.gather(*await state.get_update_tasks())
+    assert state.get_now_playing() is None
+
+
+async def test_zone_2_following_zone_1_keeps_polling_source_items():
+    """FOLLOW_ZONE_1 hides the real source, so poll permissively and drop nothing."""
+    _, state = make_state(zn=2)
+    await requested(state)
+    state._state[CommandCodes.POWER] = b"\x01"
+    state._state[CommandCodes.CURRENT_SOURCE] = _HDA_SOURCE[SourceCodes.FOLLOW_ZONE_1]
+    state._poll_power = True
+    # FOLLOW_ZONE_1 reads as "unknown source", which is what the first pass
+    # already recorded, so nothing brings the source tier forward on its own.
+    state._poll_due["source"] = 0.0
+
+    codes = set(await requested(state))
+    assert state.get_source() == SourceCodes.FOLLOW_ZONE_1
+    assert CommandCodes.RDS_INFORMATION in codes
+    assert CommandCodes.DAB_STATION in codes
+
+
+@pytest.mark.parametrize("source", [None, SourceCodes.FOLLOW_ZONE_1])
+async def test_indeterminate_source_drops_nothing(source):
+    """Unknown, or following zone 1: the real source could be anything."""
+    _, state = make_state()
+    state._state[CommandCodes.RDS_INFORMATION] = b"text"
+    state._now_playing = NowPlayingInfo(track="x")
+    state._drop_source_state(source)
+    assert state.get_rds_information() == "text"
+    assert state.get_now_playing() is not None
+
+
+async def test_connect_does_not_read_everything_twice():
+    """The pass after the initial full read must not repeat it."""
+    client, state = make_state()
+
+    async def request(zn, cc, data, priority=0):
+        if cc == CommandCodes.POWER:
+            return b"\x01"
+        if cc == CommandCodes.CURRENT_SOURCE:
+            return _HDA_SOURCE[SourceCodes.BD]
+        raise CommandInvalidAtThisTime()
+
+    client.request.side_effect = request
+
+    first = await requested(state)
+    assert len(first) > 10
+    assert await requested(state) == []

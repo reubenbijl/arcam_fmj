@@ -1197,7 +1197,7 @@ async def test_now_playing_old_format_unchanged():
     await asyncio.gather(*await state.get_update_tasks())
     info = state.get_now_playing()
     assert info.track == "Bohemian Rhapsody"
-    assert info.application == ""
+    assert info.application is None  # empty payload means "not reported"
     assert info.sample_rate == 48000
     assert info.encoder == NowPlayingEncoder.MP3
 
