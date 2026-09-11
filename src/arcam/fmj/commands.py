@@ -62,6 +62,21 @@ VOLUME_STEP_SUPPORTED = {
     ApiModel.APIST_SERIES,
 }
 
+#: Models whose tone/trim commands (0x35, 0x36, 0x3B, 0x3F, 0x40, 0x45)
+#: accept 0xF1 (increment) / 0xF2 (decrement) as data and echo the new
+#: value.  Documented in SH256E, SH274E and SH289E; preferred over the RC5
+#: step codes, which have shifted between spec issues (bass -1 in SH289E D).
+STEP_WRITE_SUPPORTED = {
+    ApiModel.API450_SERIES,
+    ApiModel.API860_SERIES,
+    ApiModel.APIHDA_SERIES,
+}
+
+#: Data byte that steps a value up by one unit on STEP_WRITE_SUPPORTED models.
+STEP_UP = 0xF1
+#: Data byte that steps a value down by one unit on STEP_WRITE_SUPPORTED models.
+STEP_DOWN = 0xF2
+
 # Short aliases for the table below.
 _Z = CommandFlags.ZONE_SUPPORT
 _U = CommandFlags.UPDATE

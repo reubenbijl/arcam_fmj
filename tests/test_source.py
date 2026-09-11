@@ -78,16 +78,22 @@ async def test_set_source(zn, api_model, source, ir, data):
     else:
         command_code = CommandCodes.CURRENT_SOURCE
 
-    client.request.return_value = ResponsePacket(
-        zn,
-        command_code,
-        AnswerCodes.STATUS_UPDATE,
-        bytes([0x01]),
-    )
+    async def request(req_zn, cc, req_data, priority=0):
+        # Behave like the unit: the source command is echoed and the zone
+        # pushes its new CURRENT_SOURCE, which set_source waits for.
+        if cc == command_code and req_data == data:
+            state._listen(ResponsePacket(
+                zn, CommandCodes.CURRENT_SOURCE, AnswerCodes.STATUS_UPDATE,
+                source.to_bytes(api_model, zn),
+            ))
+        return req_data
+
+    client.request.side_effect = request
 
     await state.set_source(source)
 
     client.request.assert_called_with(zn, command_code, data, 0)
+    assert state.get_source() == source
 
 
 @pytest.mark.parametrize(

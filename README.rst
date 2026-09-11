@@ -59,6 +59,22 @@ Code to set volume and source using console over serial.
     arcam-fmj state --serial /dev/ttyUSB0 --port 50000 --source 5 --volume 50
 
 
+JBL Synthesis notes
+===================
+
+The SDR-35, SDR-38, SDP-55 and SDP-58 speak the Arcam HDA protocol. Things
+every vendor driver for these units requires, and which apply here too:
+
+- Menu > General Setup > Control must be set to ``IP`` (RS232 and IP are
+  exclusive).
+- Menu > HDMI Settings > HDMI Bypass & IP must be ``HDMI & IP On``; the default
+  ``Low Power`` turns the network off in standby, so the unit cannot be woken.
+- The unit sends status updates only to the TCP client that last spoke to it.
+  Keep the JBL app and the unit's web page closed while another controller is
+  connected, or feedback will lag until the next poll.
+- Firmware 1.42/09 or later. On earlier firmware Random and Repeat, RDS text
+  and several setup commands do not work; the library reads them regardless.
+
 Protocol Specifications
 =======================
 

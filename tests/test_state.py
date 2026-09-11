@@ -890,26 +890,29 @@ def test_rc5_avr_has_navigation(model):
 
 
 async def test_inc_bass_equalization():
+    """AVR models step via the CC (0xF1) and cache the echoed value."""
     client = MagicMock(spec=Client)
+    client.request.return_value = bytes([0x03])
     state = make_state(client, 1, ApiModel.APIHDA_SERIES)
     await state.inc_bass_equalization()
-    client.request.assert_called_with(
-        1, CommandCodes.SIMULATE_RC5_IR_COMMAND, bytes([0x10, 0x2C]), 0)
+    client.request.assert_called_with(1, CommandCodes.BASS_EQUALIZATION, bytes([0xF1]), 0)
+    assert state.get_bass_equalization() == 3.0
 
 
 async def test_dec_bass_equalization():
     client = MagicMock(spec=Client)
+    client.request.return_value = bytes([0x81])
     state = make_state(client, 1, ApiModel.APIHDA_SERIES)
     await state.dec_bass_equalization()
-    client.request.assert_called_with(
-        1, CommandCodes.SIMULATE_RC5_IR_COMMAND, bytes([0x10, 0x38]), 0)
+    client.request.assert_called_with(1, CommandCodes.BASS_EQUALIZATION, bytes([0xF2]), 0)
+    assert state.get_bass_equalization() == -1.0
 
 
 async def test_inc_bass_equalization_unsupported():
-    """SA series has no bass RC5 codes."""
+    """SA series has neither the bass CC nor bass RC5 codes."""
     client = MagicMock(spec=Client)
     state = make_state(client, 1, ApiModel.APISA_SERIES)
-    with pytest.raises(ValueError):
+    with pytest.raises((ValueError, UnsupportedCommand)):
         await state.inc_bass_equalization()
 
 

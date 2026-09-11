@@ -2,6 +2,9 @@
 
 import asyncio
 import logging
+import time
+from collections.abc import Callable
+from datetime import timedelta
 from typing import Any, TypeVar
 
 import attr
@@ -37,6 +40,9 @@ from .commands import (
     MUTE_WRITE_SUPPORTED,
     POWER_WRITE_SUPPORTED,
     SOURCE_WRITE_SUPPORTED,
+    STEP_DOWN,
+    STEP_UP,
+    STEP_WRITE_SUPPORTED,
     VOLUME_STEP_SUPPORTED,
 )
 from .errors import (
@@ -93,6 +99,64 @@ from .utils import run_tasks, wait_any
 _LOGGER = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
+# --- Polling tiers ---
+#
+# The client's update loop asks for tasks back-to-back, so without pacing a
+# zone re-reads every UPDATE-flagged command as fast as the device answers.
+# The device pushes unsolicited status updates for user-visible changes
+# (SH289E "State changes as a result of other inputs"), so polling only
+# needs to catch what a push would miss.  Tiers follow the pacing the
+# Control4/Crestron/RTI drivers use: a few fast items, source-specific
+# items only while that source is selected, and everything else slowly.
+
+#: Power, volume, mute, source: re-read at this interval while powered on.
+_POLL_FAST_INTERVAL = timedelta(seconds=1)
+#: Tuner / network / Bluetooth info for the active source.
+_POLL_SOURCE_INTERVAL = timedelta(seconds=3)
+#: Tone, trims, decode modes, incoming signal, etc.  Pushed on change.
+_POLL_SLOW_INTERVAL = timedelta(seconds=15)
+
+_POLL_FAST_COMMANDS = frozenset({
+    CommandCodes.POWER,
+    CommandCodes.VOLUME,
+    CommandCodes.MUTE,
+    CommandCodes.CURRENT_SOURCE,
+})
+
+_TUNER_SOURCES = frozenset({SourceCodes.FM, SourceCodes.DAB})
+_NETWORK_SOURCES = frozenset({SourceCodes.NET, SourceCodes.USB, SourceCodes.NET_USB})
+_BLUETOOTH_SOURCES = frozenset({SourceCodes.BT})
+
+#: Commands the device only answers (else 0x85) while one of these sources
+#: is selected.  Skipped otherwise, and their cached state is dropped when
+#: the zone switches away from such a source.
+_POLL_SOURCE_COMMANDS: dict[CommandCodes, frozenset[SourceCodes]] = {
+    CommandCodes.RDS_INFORMATION: frozenset({SourceCodes.FM}),
+    CommandCodes.TUNER_PRESET: _TUNER_SOURCES,
+    CommandCodes.PRESET_DETAIL: _TUNER_SOURCES,
+    CommandCodes.DAB_STATION: frozenset({SourceCodes.DAB}),
+    CommandCodes.DLS_PDT_INFO: frozenset({SourceCodes.DAB}),
+    CommandCodes.NETWORK_PLAYBACK_STATUS: _NETWORK_SOURCES,
+    CommandCodes.NOW_PLAYING_INFO: _NETWORK_SOURCES,
+    CommandCodes.BLUETOOTH_STATUS: _BLUETOOTH_SOURCES,
+}
+
+# --- Source selection ---
+#
+# A source command sent while the zone is coming out of standby is dropped
+# by the unit; every vendor driver powers on, waits for the power echo, then
+# sends the source and verifies it (Control4 v106, Elan 1.0.8/1.1.2, RTI
+# setInput/checkWaitingInput).
+
+#: How long to wait for the zone to report powered on before sending a source.
+_SOURCE_POWER_ON_TIMEOUT = timedelta(seconds=6)
+#: How long to wait for the source echo before verifying with a read.
+_SOURCE_SETTLE_TIMEOUT = timedelta(seconds=2)
+#: Poll interval while waiting on either of the above.
+_SOURCE_WAIT_INTERVAL = timedelta(milliseconds=250)
+#: Explicitly re-read the awaited value every this many wait intervals.
+_SOURCE_WAIT_READ_EVERY = 4
+
 
 
 def _get_scaled_negative(data: bytes | None, min_value: float, max_value: float, scale: float) -> float | None:
@@ -130,6 +194,12 @@ class State:
         self._amxduet: AmxDuetResponse | None = None
         self._unsupported_commands: set[CommandCodes] = set()
         self._updated = asyncio.Event()
+        # Polling bookkeeping (see the tier constants above).
+        self._poll_due: dict[str, float] = {"fast": 0.0, "source": 0.0, "slow": 0.0}
+        self._poll_power: bool | None = None
+        self._poll_source: SourceCodes | None = None
+        self._presets_source: SourceCodes | None = None
+        self._presets_stale = True
 
     async def start(self) -> None:
         # pylint: disable=protected-access
@@ -273,6 +343,52 @@ class State:
         await self._request(
             self._zn, CommandCodes.SIMULATE_RC5_IR_COMMAND, command
         )
+
+    async def _write(self, cc: CommandCodes, data: bytes) -> bytes:
+        """Write a value and cache the device's echo of the new value."""
+        response = await self._request(self._zn, cc, data)
+        self._state[cc] = response
+        return response
+
+    async def _step(self, cc: CommandCodes, up: bool, rc5_table: dict | None) -> None:
+        """Step a value by one unit.
+
+        Uses the CC-level 0xF1/0xF2 data bytes where the model supports them
+        (the reply carries the new value); otherwise falls back to RC5.
+        """
+        if self._api_model in STEP_WRITE_SUPPORTED:
+            await self._write(cc, bytes([STEP_UP if up else STEP_DOWN]))
+        elif rc5_table is not None:
+            await self._send_rc5(rc5_table, up)
+        else:
+            raise UnsupportedCommand(cc=cc, model=self.model)
+
+    async def _refresh(self, cc: CommandCodes) -> None:
+        """Best-effort re-read of one command into the cache."""
+        try:
+            self._state[cc] = await self._request(self._zn, cc, bytes([0xF0]))
+        except (ResponseException, NotConnectedException, TimeoutError, UnsupportedCommand) as e:
+            _LOGGER.debug("Refresh of %s failed: %s", cc, e)
+
+    async def _wait_for(
+        self, cc: CommandCodes, predicate: Callable[[], bool], timeout: timedelta
+    ) -> bool:
+        """Wait for ``predicate`` to hold, re-reading ``cc`` periodically.
+
+        Pushed status updates normally satisfy the predicate; the periodic
+        read covers a unit that does not push (or whose pushes are going to
+        another client).  Returns False on timeout.
+        """
+        deadline = time.monotonic() + timeout.total_seconds()
+        iteration = 0
+        while not predicate():
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(_SOURCE_WAIT_INTERVAL.total_seconds())
+            iteration += 1
+            if iteration % _SOURCE_WAIT_READ_EVERY == 0:
+                await self._refresh(cc)
+        return True
 
     def get(self, cc):
         return self._state[cc]
@@ -436,13 +552,13 @@ class State:
     async def set_lipsync_delay(self, delay_ms: int) -> None:
         """Set lip sync delay in milliseconds (0-250ms in 5ms steps)."""
         byte_val = _set_scaled(delay_ms, 0.0, 250.0, 5.0)
-        await self._request(self._zn, CommandCodes.LIPSYNC_DELAY, bytes([byte_val]))
+        await self._write(CommandCodes.LIPSYNC_DELAY, bytes([byte_val]))
 
     async def inc_lipsync_delay(self) -> None:
-        await self._send_rc5(RC5CODE_LIPSYNC, True)
+        await self._step(CommandCodes.LIPSYNC_DELAY, True, RC5CODE_LIPSYNC)
 
     async def dec_lipsync_delay(self) -> None:
-        await self._send_rc5(RC5CODE_LIPSYNC, False)
+        await self._step(CommandCodes.LIPSYNC_DELAY, False, RC5CODE_LIPSYNC)
 
     def get_subwoofer_trim(self) -> float | None:
         """Return subwoofer trim level in dB (-10 to +10 dB in 0.5dB steps)."""
@@ -452,13 +568,13 @@ class State:
     async def set_subwoofer_trim(self, trim_db: float) -> None:
         """Set subwoofer trim level in dB (-10 to +10 dB in 0.5dB steps)."""
         byte_val = _set_scaled(trim_db, -10.0, 10.0, 0.5)
-        await self._request(self._zn, CommandCodes.SUBWOOFER_TRIM, bytes([byte_val]))
+        await self._write(CommandCodes.SUBWOOFER_TRIM, bytes([byte_val]))
 
     async def inc_subwoofer_trim(self) -> None:
-        await self._send_rc5(RC5CODE_SUB_TRIM, True)
+        await self._step(CommandCodes.SUBWOOFER_TRIM, True, RC5CODE_SUB_TRIM)
 
     async def dec_subwoofer_trim(self) -> None:
-        await self._send_rc5(RC5CODE_SUB_TRIM, False)
+        await self._step(CommandCodes.SUBWOOFER_TRIM, False, RC5CODE_SUB_TRIM)
 
     def get_sub_stereo_trim(self) -> float | None:
         """Return sub stereo trim level in dB (0 to -10 dB in 0.5dB steps)."""
@@ -468,7 +584,15 @@ class State:
     async def set_sub_stereo_trim(self, trim_db: float) -> None:
         """Set sub stereo trim level in dB (0 to -10 dB in 0.5dB steps)."""
         byte_val = _set_scaled(trim_db, -10.0, 0.0, 0.5)
-        await self._request(self._zn, CommandCodes.SUB_STEREO_TRIM, bytes([byte_val]))
+        await self._write(CommandCodes.SUB_STEREO_TRIM, bytes([byte_val]))
+
+    async def inc_sub_stereo_trim(self) -> None:
+        """Raise sub stereo trim by 0.5dB (no RC5 equivalent exists)."""
+        await self._step(CommandCodes.SUB_STEREO_TRIM, True, None)
+
+    async def dec_sub_stereo_trim(self) -> None:
+        """Lower sub stereo trim by 0.5dB (no RC5 equivalent exists)."""
+        await self._step(CommandCodes.SUB_STEREO_TRIM, False, None)
 
     def get_treble_equalization(self) -> float | None:
         """Return treble equalization level in dB (-12 to +12 dB in 1dB steps)."""
@@ -478,13 +602,13 @@ class State:
     async def set_treble_equalization(self, trim_db: float) -> None:
         """Set treble equalization level in dB (-12 to +12 dB in 1dB steps)."""
         byte_val = _set_scaled(trim_db, -12.0, 12.0, 1.0)
-        await self._request(self._zn, CommandCodes.TREBLE_EQUALIZATION, bytes([byte_val]))
+        await self._write(CommandCodes.TREBLE_EQUALIZATION, bytes([byte_val]))
 
     async def inc_treble_equalization(self) -> None:
-        await self._send_rc5(RC5CODE_TREBLE, True)
+        await self._step(CommandCodes.TREBLE_EQUALIZATION, True, RC5CODE_TREBLE)
 
     async def dec_treble_equalization(self) -> None:
-        await self._send_rc5(RC5CODE_TREBLE, False)
+        await self._step(CommandCodes.TREBLE_EQUALIZATION, False, RC5CODE_TREBLE)
 
     def get_bass_equalization(self) -> float | None:
         """Return bass equalization level in dB (-12 to +12 dB in 1dB steps)."""
@@ -494,13 +618,13 @@ class State:
     async def set_bass_equalization(self, trim_db: float) -> None:
         """Set bass equalization level in dB (-12 to +12 dB in 1dB steps)."""
         byte_val = _set_scaled(trim_db, -12.0, 12.0, 1.0)
-        await self._request(self._zn, CommandCodes.BASS_EQUALIZATION, bytes([byte_val]))
+        await self._write(CommandCodes.BASS_EQUALIZATION, bytes([byte_val]))
 
     async def inc_bass_equalization(self) -> None:
-        await self._send_rc5(RC5CODE_BASS, True)
+        await self._step(CommandCodes.BASS_EQUALIZATION, True, RC5CODE_BASS)
 
     async def dec_bass_equalization(self) -> None:
-        await self._send_rc5(RC5CODE_BASS, False)
+        await self._step(CommandCodes.BASS_EQUALIZATION, False, RC5CODE_BASS)
 
     def get_room_equalization(self) -> RoomEqMode | None:
         """Return room equalization (DIRAC) mode."""
@@ -558,15 +682,15 @@ class State:
     async def set_balance(self, value: float) -> None:
         """Set balance level (-6 to +6 in 1dB steps)."""
         byte_val = _set_scaled(value, -6.0, 6.0, 1.0)
-        await self._request(self._zn, CommandCodes.BALANCE, bytes([byte_val]))
+        await self._write(CommandCodes.BALANCE, bytes([byte_val]))
 
     async def inc_balance(self) -> None:
         """Shift balance right."""
-        await self._send_rc5(RC5CODE_BALANCE, True)
+        await self._step(CommandCodes.BALANCE, True, RC5CODE_BALANCE)
 
     async def dec_balance(self) -> None:
         """Shift balance left."""
-        await self._send_rc5(RC5CODE_BALANCE, False)
+        await self._step(CommandCodes.BALANCE, False, RC5CODE_BALANCE)
 
     def get_compression(self) -> CompressionMode | None:
         """Return the dynamic range compression setting."""
@@ -630,12 +754,43 @@ class State:
             _LOGGER.warning("Failed to get input name: %s", e)
             return None
 
-    async def set_source(self, src: SourceCodes) -> None:
+    async def _send_source(self, src: SourceCodes) -> None:
         if self._api_model in SOURCE_WRITE_SUPPORTED:
             value = src.to_bytes(self._api_model, self._zn)
             await self._request(self._zn, CommandCodes.CURRENT_SOURCE, value)
         else:
             await self._send_rc5(RC5CODE_SOURCE, src)
+
+    async def set_source(self, src: SourceCodes) -> None:
+        """Select a source, powering the zone on first if it is in standby.
+
+        The unit drops a source command sent while it is still waking, so
+        wait for the power echo before sending.  The selection is then
+        confirmed against the reported source and re-sent once if it did
+        not take.
+        """
+        if self.get_power() is False:
+            await self.set_power(True)
+            if not await self._wait_for(
+                CommandCodes.POWER, lambda: self.get_power() is True, _SOURCE_POWER_ON_TIMEOUT
+            ):
+                _LOGGER.warning(
+                    "Zone %s did not report power on within %s; sending source anyway",
+                    self._zn, _SOURCE_POWER_ON_TIMEOUT,
+                )
+
+        await self._send_source(src)
+        if await self._wait_for(
+            CommandCodes.CURRENT_SOURCE, lambda: self.get_source() == src, _SOURCE_SETTLE_TIMEOUT
+        ):
+            return
+
+        await self._refresh(CommandCodes.CURRENT_SOURCE)
+        if self.get_source() == src:
+            return
+
+        _LOGGER.debug("Zone %s reports %s after selecting %s, re-sending", self._zn, self.get_source(), src)
+        await self._send_source(src)
 
     def get_volume(self) -> int | None:
         value = self._state.get(CommandCodes.VOLUME)
@@ -687,6 +842,14 @@ class State:
 
     def get_preset_details(self) -> dict[int, PresetDetail]:
         return self._presets
+
+    def refresh_presets(self) -> None:
+        """Re-read the tuner preset list on the next update pass.
+
+        Presets are otherwise read once each time FM or DAB is selected,
+        since 50 reads per pass is what made the vendor drivers sluggish.
+        """
+        self._presets_stale = True
 
     async def send_navigation(self, code: RC5CodeNavigation) -> None:
         await self._send_rc5(RC5CODE_NAVIGATION, code)
@@ -783,6 +946,7 @@ class State:
                 _LOGGER.error("Timeout requesting %s", cc)
 
         async def _update_presets() -> None:
+            source = self.get_source()
             presets = {}
             for preset in range(1, 51):
                 try:
@@ -803,6 +967,8 @@ class State:
                     _LOGGER.error("Timeout requesting preset %s", preset)
                     return
             self._presets = presets
+            self._presets_source = source
+            self._presets_stale = False
 
         async def _update_now_playing() -> None:
             kwargs = {}
@@ -857,17 +1023,17 @@ class State:
                 self._state = dict()
                 self._now_playing = None
             self._updated.clear()
+            self._poll_due = {"fast": 0.0, "source": 0.0, "slow": 0.0}
+            self._poll_power = None
+            self._poll_source = None
+            self._presets_stale = True
             return []
 
         if self._amxduet is None:
             await _update_amxduet()
 
         tasks: list[UpdateTask] = []
-        for cc in CommandCodes:
-            if not (cc.flags & CommandFlags.UPDATE):
-                continue
-            if not self._is_command_supported(cc):
-                continue
+        for cc in self._due_commands():
             if cc == CommandCodes.NOW_PLAYING_INFO:
                 tasks.append(_update_now_playing())
             elif cc == CommandCodes.PRESET_DETAIL:
@@ -889,6 +1055,80 @@ class State:
             return [_run_and_signal()]
 
         return tasks
+
+    def _drop_source_state(self, source: SourceCodes | None) -> None:
+        """Forget cached info that only applies to sources other than ``source``."""
+        for cc, sources in _POLL_SOURCE_COMMANDS.items():
+            if source in sources:
+                continue
+            if cc == CommandCodes.NOW_PLAYING_INFO:
+                self._now_playing = None
+            elif cc == CommandCodes.PRESET_DETAIL:
+                continue  # presets are a property of the tuner, keep them
+            elif cc in self._state:
+                self._state[cc] = None
+
+    def _due_commands(self) -> list[CommandCodes]:
+        """Pick the UPDATE-flagged commands to read on this pass.
+
+        The first pass after connecting reads everything so ``update()``
+        returns a complete picture.  After that, commands are read on their
+        tier's interval, source-specific commands only while that source is
+        selected, and nothing but POWER while the zone is in standby.  A
+        power-on or source change brings the affected tiers forward.
+        """
+        now = time.monotonic()
+        power = self.get_power()
+        source = self.get_source()
+
+        if power and not self._poll_power:
+            # Came out of standby (or first sight of it on): refresh everything.
+            self._poll_due = {"fast": 0.0, "source": 0.0, "slow": 0.0}
+        if source != self._poll_source:
+            self._poll_due["source"] = 0.0
+            self._drop_source_state(source)
+        self._poll_power = power
+        self._poll_source = source
+
+        first_pass = not self._updated.is_set()
+        due_tiers = {
+            tier for tier, due in self._poll_due.items() if first_pass or now >= due
+        }
+
+        commands: list[CommandCodes] = []
+        for cc in CommandCodes:
+            if not (cc.flags & CommandFlags.UPDATE):
+                continue
+            if not self._is_command_supported(cc):
+                continue
+            if power is False and cc != CommandCodes.POWER:
+                continue
+
+            if cc in _POLL_FAST_COMMANDS:
+                tier = "fast"
+            elif cc in _POLL_SOURCE_COMMANDS:
+                tier = "source"
+                if source is not None and source not in _POLL_SOURCE_COMMANDS[cc]:
+                    continue
+                if cc == CommandCodes.PRESET_DETAIL:
+                    if source is None:
+                        continue  # wait until we know a tuner source is selected
+                    if source == self._presets_source and not self._presets_stale:
+                        continue
+            else:
+                tier = "slow"
+
+            if tier in due_tiers:
+                commands.append(cc)
+
+        intervals = {
+            "fast": _POLL_FAST_INTERVAL,
+            "source": _POLL_SOURCE_INTERVAL,
+            "slow": _POLL_SLOW_INTERVAL,
+        }
+        for tier in due_tiers:
+            self._poll_due[tier] = now + intervals[tier].total_seconds()
+        return commands
 
     async def update(self) -> None:
         """Block until the provider-driven update loop completes one pass."""
