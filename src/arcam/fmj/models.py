@@ -36,6 +36,8 @@ APIVERSION_HDA_SERIES = {
     "AVR21",
     "AVR31",
     "AV41",
+    "SDR-35",
+    "SDR-38",
     "SDP-55",
     "SDP-58",
 }
@@ -48,6 +50,8 @@ APIVERSION_HDA_PREMIUM_SERIES = {
     "AVR21",
     "AVR31",
     "AV41",
+    "SDR-35",
+    "SDR-38",
     "SDP-55",
     "SDP-58",
 }
@@ -58,6 +62,8 @@ APIVERSION_HDA_MULTI_ZONE_SERIES = {
     "AVR21",
     "AVR31",
     "AV41",
+    "SDR-35",
+    "SDR-38",
     "SDP-55",
     "SDP-58",
 }

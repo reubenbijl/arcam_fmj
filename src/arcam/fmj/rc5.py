@@ -230,6 +230,12 @@ RC5CODE_DECODE_MODE_2CH: dict[tuple[ApiModel, int], dict[DecodeMode2CH, bytes]] 
         DecodeMode2CH.DTS_NEO_6_MUSIC: bytes([16, 112]),
         DecodeMode2CH.MCH_STEREO: bytes([16, 69]),
     },
+    # HDA codes for Virtual:X / Virtual Height / Logic 16 follow the Janus
+    # Control4/Crestron/RTI drivers (tested on JBL SDR-35 firmware 1.42-1.60):
+    # 16-115 selects DTS Virtual:X (reads back 0x0C), 16-23 selects Dolby
+    # Virtual Height (reads back 0x0D) and 16-114 selects Logic 16 (reads
+    # back 0x0B).  SH289E lists 16-115 as "Virtual Height" and 16-23 as
+    # "Dolby D EX", which does not match what the units do.
     (ApiModel.APIHDA_SERIES, 1): {
         DecodeMode2CH.STEREO: bytes([16, 107]),
         DecodeMode2CH.DOLBY_SURROUND: bytes([16, 110]),
@@ -237,7 +243,9 @@ RC5CODE_DECODE_MODE_2CH: dict[tuple[ApiModel, int], dict[DecodeMode2CH, bytes]] 
         DecodeMode2CH.DTS_NEO_6_MUSIC: bytes([16, 112]),
         DecodeMode2CH.MCH_STEREO: bytes([16, 69]),
         DecodeMode2CH.DTS_NEURAL_X: bytes([16, 113]),
-        DecodeMode2CH.DOLBY_VIRTUAL_HEIGHT: bytes([16, 115]),
+        DecodeMode2CH.LOGIC_16: bytes([16, 114]),
+        DecodeMode2CH.DTS_VIRTUAL_X: bytes([16, 115]),
+        DecodeMode2CH.DOLBY_VIRTUAL_HEIGHT: bytes([16, 23]),
         DecodeMode2CH.AURO_NATIVE: bytes([16, 103]),
         DecodeMode2CH.AURO_MATIC_3D: bytes([16, 71]),
         DecodeMode2CH.AURO_2D: bytes([16, 104]),
@@ -261,12 +269,15 @@ RC5CODE_DECODE_MODE_MCH: dict[tuple[ApiModel, int], dict[DecodeModeMCH, bytes]] 
         DecodeModeMCH.DOLBY_SURROUND: bytes([16, 110]),
         DecodeModeMCH.DTS_VIRTUAL_X: bytes([16, 115]),
     },
+    # See the note on the HDA entry in RC5CODE_DECODE_MODE_2CH.
     (ApiModel.APIHDA_SERIES, 1): {
         DecodeModeMCH.STEREO_DOWNMIX: bytes([16, 107]),
         DecodeModeMCH.MULTI_CHANNEL: bytes([16, 106]),
         DecodeModeMCH.DOLBY_D_EX_OR_DTS_ES: bytes([16, 113]),  # maps to DTS_NEURAL_X
         DecodeModeMCH.DOLBY_SURROUND: bytes([16, 110]),
-        DecodeModeMCH.DOLBY_VIRTUAL_HEIGHT: bytes([16, 115]),
+        DecodeModeMCH.LOGIC_16: bytes([16, 114]),
+        DecodeModeMCH.DTS_VIRTUAL_X: bytes([16, 115]),
+        DecodeModeMCH.DOLBY_VIRTUAL_HEIGHT: bytes([16, 23]),
         DecodeModeMCH.AURO_NATIVE: bytes([16, 103]),
         DecodeModeMCH.AURO_MATIC_3D: bytes([16, 71]),
         DecodeModeMCH.AURO_2D: bytes([16, 104]),

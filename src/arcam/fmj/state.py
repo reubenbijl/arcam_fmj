@@ -809,10 +809,17 @@ class State:
             for field in attr.fields(NowPlayingInfo):
                 if "request" not in field.metadata:
                     continue
+                request = field.metadata["request"]
                 try:
                     data = await self._request(
-                        self._zn, CommandCodes.NOW_PLAYING_INFO, bytes([field.metadata["request"]]), priority
+                        self._zn, CommandCodes.NOW_PLAYING_INFO, bytes([request]), priority
                     )
+                    # Newer firmware (JBL SDR/SDP, Arcam HDA from ~1.42) echoes
+                    # the sub-request byte as Data1 before the payload; older
+                    # firmware sends the payload alone.  Strip the echo so the
+                    # converters see only the payload.
+                    if data[:1] == bytes([request]):
+                        data = data[1:]
                     kwargs[field.name] = field.metadata["converter"](data)
                 except CommandNotRecognised:
                     _LOGGER.debug("Now playing not supported")

@@ -120,6 +120,10 @@ class DecodeMode2CH(IntOrTypeEnum):
     450 series has Dolby PLIIx variants (0x02/0x03/0x05/0x06) instead of
     Dolby Surround (0x04).
 
+    0x0B is listed as "Reserved" in SH289E but is what JBL/Arcam HDA units
+    report for the Logic 16 upmixer (RC5 16-114); the Control4 and Crestron
+    drivers name it "L16-Immersion" / "LOGIC_16".
+
     See: SH289E "Request decode mode status — 2ch (0x10)";
          SH256E "Request decode mode status — 2ch (0x10)".
     """
@@ -135,6 +139,7 @@ class DecodeMode2CH(IntOrTypeEnum):
     MCH_STEREO = 0x09
 
     DTS_NEURAL_X = 0x0A, APIVERSION_AVR_860_ONWARD_SERIES
+    LOGIC_16 = 0x0B, APIVERSION_HDA_SERIES
     DTS_VIRTUAL_X = 0x0C, APIVERSION_AVR_860_ONWARD_SERIES
 
     DOLBY_VIRTUAL_HEIGHT = 0x0D, APIVERSION_HDA_SERIES
@@ -164,6 +169,7 @@ class DecodeModeMCH(IntOrTypeEnum):
     DOLBY_PLII_IIx_MUSIC = 0x05, APIVERSION_DOLBY_PL_SERIES
 
     DOLBY_SURROUND = 0x06, APIVERSION_AVR_860_ONWARD_SERIES
+    LOGIC_16 = 0x0B, APIVERSION_HDA_SERIES  # "Reserved" in SH289E; see DecodeMode2CH
     DTS_VIRTUAL_X = 0x0C, APIVERSION_AVR_860_ONWARD_SERIES
 
     DOLBY_VIRTUAL_HEIGHT = 0x0D, APIVERSION_HDA_SERIES

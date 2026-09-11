@@ -7,6 +7,8 @@ from arcam.fmj.codecs import (
     AnswerCodes,
     BluetoothAudioStatus,
     CompressionMode,
+    DecodeMode2CH,
+    DecodeModeMCH,
     DisplayBrightness,
     DolbyAudioMode,
     HdmiOutput,
@@ -1118,3 +1120,121 @@ async def test_set_video_selection():
     state = State(client, 1)
     await state.set_video_selection(VideoSelection.SAT)
     client.request.assert_called_with(1, CommandCodes.VIDEO_SELECTION, bytes([0x01]), 0)
+
+
+# --- JBL Synthesis SDR/SDP models ---
+
+
+@pytest.mark.parametrize("model", ["SDR-35", "SDR-38", "SDP-55", "SDP-58"])
+def test_jbl_synthesis_models_resolve_to_hda(model):
+    """JBL Synthesis units report their model over AMX and must map to the HDA API."""
+    client = MagicMock(spec=Client)
+    z1, z2 = State(client, 1), State(client, 2)
+    amx = AmxDuetResponse({"Device-Make": "JBL", "Device-Model": model})
+    z1._listen(amx)
+    z2._listen(amx)
+    assert z1._api_model == z2._api_model == ApiModel.APIHDA_SERIES
+    # HDA-only commands, including the multi-zone settings block, are available.
+    assert z1._is_command_supported(CommandCodes.BLUETOOTH_STATUS) is True
+    assert z1._is_command_supported(CommandCodes.IMAX_ENHANCED) is True
+    assert z1._is_command_supported(CommandCodes.ZONE_SETTINGS) is True
+
+
+# --- Now Playing (0x64) response formats ---
+
+
+def _now_playing_client(responses: dict[int, bytes]) -> MagicMock:
+    """A client that answers NOW_PLAYING_INFO sub-requests and rejects everything else."""
+    from arcam.fmj.errors import CommandInvalidAtThisTime
+
+    client = MagicMock(spec=Client)
+    client.connected = True
+
+    async def request(zn, cc, data, priority=0):
+        if cc != CommandCodes.NOW_PLAYING_INFO:
+            raise CommandInvalidAtThisTime()
+        return responses[data[0]]
+
+    client.request.side_effect = request
+    return client
+
+
+async def test_now_playing_strips_echoed_request_byte():
+    """Newer firmware echoes the 0xF0-0xF5 sub-request as Data1; it must be dropped."""
+    client = _now_playing_client({
+        0xF0: b"\xF0Bohemian Rhapsody",
+        0xF1: b"\xF1Queen",
+        0xF2: b"\xF2A Night at the Opera",
+        0xF3: b"\xF3Spotify",
+        0xF4: b"\xF4\x01",
+        0xF5: b"\xF5\x03",
+    })
+    state = make_state(client, 1, ApiModel.APIHDA_SERIES)
+    await asyncio.gather(*await state.get_update_tasks())
+    info = state.get_now_playing()
+    assert info.track == "Bohemian Rhapsody"
+    assert info.artist == "Queen"
+    assert info.album == "A Night at the Opera"
+    assert info.application == "Spotify"
+    assert info.sample_rate == 44100
+    assert info.encoder == NowPlayingEncoder.FLAC
+
+
+async def test_now_playing_old_format_unchanged():
+    """Older firmware sends the payload alone; nothing is stripped."""
+    client = _now_playing_client({
+        0xF0: b"Bohemian Rhapsody",
+        0xF1: b"Queen",
+        0xF2: b"A Night at the Opera",
+        0xF3: b"",
+        0xF4: b"\x02",
+        0xF5: b"\x00",
+    })
+    state = make_state(client, 1, ApiModel.APIHDA_SERIES)
+    await asyncio.gather(*await state.get_update_tasks())
+    info = state.get_now_playing()
+    assert info.track == "Bohemian Rhapsody"
+    assert info.application == ""
+    assert info.sample_rate == 48000
+    assert info.encoder == NowPlayingEncoder.MP3
+
+
+# --- HDA decode-mode RC5 codes (JBL/Arcam HDA, per Janus drivers) ---
+
+
+@pytest.mark.parametrize("mode, code", [
+    (DecodeMode2CH.DTS_VIRTUAL_X, bytes([16, 115])),
+    (DecodeMode2CH.DOLBY_VIRTUAL_HEIGHT, bytes([16, 23])),
+    (DecodeMode2CH.LOGIC_16, bytes([16, 114])),
+    (DecodeMode2CH.DOLBY_SURROUND, bytes([16, 110])),
+])
+async def test_set_decode_mode_2ch_hda(mode, code):
+    client = MagicMock(spec=Client)
+    state = make_state(client, 1, ApiModel.APIHDA_SERIES)
+    await state.set_decode_mode_2ch(mode)
+    client.request.assert_called_with(1, CommandCodes.SIMULATE_RC5_IR_COMMAND, code, 0)
+
+
+@pytest.mark.parametrize("mode, code", [
+    (DecodeModeMCH.DTS_VIRTUAL_X, bytes([16, 115])),
+    (DecodeModeMCH.DOLBY_VIRTUAL_HEIGHT, bytes([16, 23])),
+    (DecodeModeMCH.LOGIC_16, bytes([16, 114])),
+    (DecodeModeMCH.MULTI_CHANNEL, bytes([16, 106])),
+])
+async def test_set_decode_mode_mch_hda(mode, code):
+    client = MagicMock(spec=Client)
+    state = make_state(client, 1, ApiModel.APIHDA_SERIES)
+    await state.set_decode_mode_mch(mode)
+    client.request.assert_called_with(1, CommandCodes.SIMULATE_RC5_IR_COMMAND, code, 0)
+
+
+def test_logic_16_decodes_from_reserved_byte():
+    client = MagicMock(spec=Client)
+    state = make_state(client, 1, ApiModel.APIHDA_SERIES)
+    state._state[CommandCodes.DECODE_MODE_STATUS_2CH] = bytes([0x0B])
+    state._state[CommandCodes.DECODE_MODE_STATUS_MCH] = bytes([0x0B])
+    assert state.get_decode_mode_2ch() == DecodeMode2CH.LOGIC_16
+    assert state.get_decode_mode_mch() == DecodeModeMCH.LOGIC_16
+    # Selectable set exposed to Home Assistant includes the new modes.
+    assert DecodeMode2CH.LOGIC_16 in state.get_decode_modes()
+    assert DecodeMode2CH.DTS_VIRTUAL_X in state.get_decode_modes()
