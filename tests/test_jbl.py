@@ -439,6 +439,7 @@ async def test_volume_step_on_st_series_uses_the_step_command():
             True,
         ),
         (lambda s: s.set_power(True), CommandCodes.POWER, bytes([0x01]), True),
+        (lambda s: s.set_power(True), CommandCodes.POWER, bytes([0x00]), False),
         (lambda s: s.set_power(False), CommandCodes.POWER, bytes([0x00]), True),
     ],
 )
@@ -451,6 +452,7 @@ async def test_rc5_commands_without_echo(action, cc, status, confirmed, monkeypa
     """
     # No push arrives here; go straight to the read-back.
     monkeypatch.setattr("arcam.fmj.state._CONFIRM_TIMEOUT", timedelta(0))
+    monkeypatch.setattr("arcam.fmj.state._POWER_ON_TIMEOUT", timedelta(0))
     state = make_state("SDR-35")
 
     async def request(zn, command, data, priority=0):
@@ -466,3 +468,100 @@ async def test_rc5_commands_without_echo(action, cc, status, confirmed, monkeypa
     else:
         with pytest.raises(TimeoutError):
             await action(state)
+
+
+@pytest.mark.parametrize(
+    ("action", "cc"),
+    [
+        (
+            lambda s: s.set_decode_mode_2ch(DecodeMode2CH.DOLBY_VIRTUAL_HEIGHT),
+            CommandCodes.DECODE_MODE_STATUS_2CH,
+        ),
+        (
+            lambda s: s.set_decode_mode_mch(DecodeModeMCH.DOLBY_VIRTUAL_HEIGHT),
+            CommandCodes.DECODE_MODE_STATUS_MCH,
+        ),
+    ],
+)
+@pytest.mark.parametrize("reported", [bytes([0x0C]), bytes([0x0D])])
+async def test_virtual_height_is_confirmed_by_either_report(action, cc, reported):
+    """The Virtual Height key may be reported as DTS Virtual:X or Dolby Virtual Height.
+
+    The vendor drivers disagree on which, so a zone reporting either has
+    done what was asked.
+    """
+    state = make_state("SDR-35")
+
+    async def request(zn, command, data, priority=0):
+        assert command == CommandCodes.SIMULATE_RC5_IR_COMMAND
+        assert data == bytes([16, 115])
+        state._listen(ResponsePacket(zn, cc, AnswerCodes.STATUS_UPDATE, reported))
+        raise TimeoutError  # carried out, never echoed
+
+    state.client.request.side_effect = request
+    await action(state)
+    assert state._state[cc] == reported
+
+
+@pytest.mark.parametrize(
+    ("action", "cc", "reported"),
+    [
+        (
+            lambda s: s.set_decode_mode_mch(DecodeModeMCH.DOLBY_VIRTUAL_HEIGHT),
+            CommandCodes.DECODE_MODE_STATUS_MCH,
+            bytes([DecodeModeMCH.DOLBY_SURROUND]),
+        ),
+        (
+            lambda s: s.set_decode_mode_2ch(DecodeMode2CH.LOGIC_16_IMMERSION),
+            CommandCodes.DECODE_MODE_STATUS_2CH,
+            bytes([0x0C]),
+        ),
+    ],
+)
+async def test_decode_mode_is_not_confirmed_by_another_mode(
+    action, cc, reported, monkeypatch
+):
+    """Only the Virtual Height values stand in for each other."""
+    monkeypatch.setattr("arcam.fmj.state._CONFIRM_TIMEOUT", timedelta(0))
+    state = make_state("SDR-35")
+
+    async def request(zn, command, data, priority=0):
+        if command == CommandCodes.SIMULATE_RC5_IR_COMMAND:
+            raise TimeoutError
+        assert command == cc
+        return reported
+
+    state.client.request.side_effect = request
+    with pytest.raises(TimeoutError):
+        await action(state)
+
+
+async def test_power_on_waits_longer_than_other_commands(monkeypatch):
+    """A zone in standby reports power on after about 2.5 s on an SDR-35.
+
+    That is longer than other commands get, so power-on has its own
+    allowance and a slow report is not taken for a failure.
+    """
+    monkeypatch.setattr("arcam.fmj.state._CONFIRM_TIMEOUT", timedelta(0))
+    state = make_state("SDR-35")
+    state._state[CommandCodes.POWER] = bytes([0x00])
+    requests = []
+
+    async def request(zn, command, data, priority=0):
+        requests.append(command)
+        if command == CommandCodes.SIMULATE_RC5_IR_COMMAND:
+            asyncio.get_running_loop().call_later(
+                0.05,
+                state._listen,
+                ResponsePacket(
+                    zn, CommandCodes.POWER, AnswerCodes.STATUS_UPDATE, bytes([0x01])
+                ),
+            )
+            raise TimeoutError  # carried out, never echoed
+        return bytes([0x00])  # a read now would still find the zone in standby
+
+    state.client.request.side_effect = request
+    async with asyncio.timeout(5):
+        await state.set_power(True)
+    assert state.get_power() is True
+    assert requests == [CommandCodes.SIMULATE_RC5_IR_COMMAND]

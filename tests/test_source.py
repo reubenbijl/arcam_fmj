@@ -134,7 +134,7 @@ HDA = ApiModel.APIHDA_SERIES
 def no_wait(monkeypatch):
     """Stop waiting for status pushes at once, so each wait ends in a read."""
     monkeypatch.setattr("arcam.fmj.state._CONFIRM_TIMEOUT", timedelta(0))
-    monkeypatch.setattr("arcam.fmj.state._SOURCE_POWER_ON_TIMEOUT", timedelta(0))
+    monkeypatch.setattr("arcam.fmj.state._POWER_ON_TIMEOUT", timedelta(0))
 
 
 class FakeZone:
@@ -331,3 +331,68 @@ async def test_set_source_unknown_to_the_model_sends_nothing():
         await state.set_source(SourceCodes.AUX)
 
     client.request.assert_not_called()
+
+
+# --- A zone that has only just woken up ------------------------------------
+#
+# Measured on an SDR-35: after a power-on from Home Assistant the zone reported
+# being on within 2.7 s, then ignored a source command sent straight after, at
+# each of the four wakes in ten days of history. So while it may still be
+# waking, the command is sent more than _SOURCE_ATTEMPTS times.
+
+
+async def test_set_source_keeps_sending_while_the_zone_wakes(no_wait):
+    """Power on, then select a source: the order an automation uses."""
+    state = hda_state(power=False)
+    zone = FakeZone(state, power=False, drops=4)
+
+    await state.set_power(True)
+    await state.set_source(SourceCodes.BD)
+
+    assert zone.rc5 == [
+        RC5CODE_POWER[(HDA, 1)][True],
+        *[source_code(1, SourceCodes.BD)] * 5,
+    ]
+    assert state.get_source() == SourceCodes.BD
+
+
+async def test_set_source_stops_sending_once_the_zone_has_woken(
+    no_wait, monkeypatch, caplog
+):
+    """The extra attempts end _SOURCE_WAKE_TIME after the power-on report."""
+    clock = [100.0]
+    monkeypatch.setattr("arcam.fmj.state._monotonic", lambda: clock[0])
+    state = hda_state(power=False)
+    zone = FakeZone(state, power=False, drops=100)
+    execute = zone.execute
+
+    def execute_after_a_while(code: bytes) -> None:
+        # Each attempt takes about this long on the unit: the echo window,
+        # the confirm window and a read.
+        clock[0] += 2.6
+        execute(code)
+
+    zone.execute = execute_after_a_while
+
+    with pytest.raises(TimeoutError):
+        await state.set_source(SourceCodes.BD)
+
+    # Powered on at 102.6; attempts end at 105.2, 107.8, ... 118.2, which
+    # is the first past 102.6 + 15.
+    assert zone.rc5 == [
+        RC5CODE_POWER[(HDA, 1)][True],
+        *[source_code(1, SourceCodes.BD)] * 6,
+    ]
+    assert "did not switch to BD" in caplog.text
+
+
+async def test_power_reported_on_connecting_is_not_a_wake(no_wait):
+    """Only a change from standby to on counts, not the first report."""
+    state = hda_state(power=None)
+    zone = FakeZone(state, power=True, drops=100)
+    zone.report(CommandCodes.POWER, bytes([0x01]))
+
+    with pytest.raises(TimeoutError):
+        await state.set_source(SourceCodes.BD)
+
+    assert zone.rc5 == [source_code(1, SourceCodes.BD)] * 3

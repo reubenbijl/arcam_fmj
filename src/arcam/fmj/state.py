@@ -2,8 +2,10 @@
 
 import asyncio
 import enum
+import itertools
 import logging
 import time
+from collections.abc import Collection
 from datetime import timedelta
 from typing import Any, TypeVar
 
@@ -194,6 +196,24 @@ def _monotonic() -> float:
 #: How long a command waits for the zone to report its effect, when the unit
 #: does not echo the command itself (simulated RC5 on an SDR-35).
 _CONFIRM_TIMEOUT = timedelta(seconds=2)
+#: How long a zone in standby gets to report that it is on. An SDR-35 takes
+#: about 2.5 s, longer than _CONFIRM_TIMEOUT.
+_POWER_ON_TIMEOUT = timedelta(seconds=15)
+
+#: Virtual Height is one key (RC5 16-115), but the zone may report it as DTS
+#: Virtual:X (0x0C) or as Dolby Virtual Height (0x0D): the vendor drivers
+#: disagree, and it may depend on the stream. Either value confirms it, in
+#: both decode-mode enums.
+_VIRTUAL_HEIGHT = frozenset({bytes([0x0C]), bytes([0x0D])})
+
+
+def _decode_mode_confirmations(
+    mode: DecodeMode2CH | DecodeModeMCH,
+) -> frozenset[bytes]:
+    """Return the decode-mode values that confirm ``mode`` was selected."""
+    value = bytes([int(mode)])
+    return _VIRTUAL_HEIGHT if value in _VIRTUAL_HEIGHT else frozenset({value})
+
 
 # --- Source selection ---
 #
@@ -202,10 +222,13 @@ _CONFIRM_TIMEOUT = timedelta(seconds=2)
 # then checks the source it reports and sends the command again if it did not
 # take.
 
-#: How long a zone in standby gets to report that it is on.
-_SOURCE_POWER_ON_TIMEOUT = timedelta(seconds=15)
 #: Source commands sent before giving up.
 _SOURCE_ATTEMPTS = 3
+#: How long after reporting power on a zone may still drop a source command.
+#: Until then the command is sent again beyond _SOURCE_ATTEMPTS. An SDR-35
+#: ignored a source command sent about a second after it reported power on,
+#: at each of the four wakes in ten days of Home Assistant history.
+_SOURCE_WAKE_TIME = timedelta(seconds=15)
 
 
 def _get_byte(data: bytes | None) -> int | None:
@@ -250,6 +273,8 @@ class State:
         self._updated = asyncio.Event()
         # Set whenever a status message for this zone is recorded.
         self._changed = asyncio.Event()
+        # When the zone last reported that it had gone from standby to on.
+        self._woke_at: float | None = None
         self._volume_lock = asyncio.Lock()
         # Update pacing, see _due_commands: the connection the cache belongs
         # to, when each tier is next due, and the power and source seen by the
@@ -326,6 +351,12 @@ class State:
             return
 
         if packet.ac == AnswerCodes.STATUS_UPDATE:
+            if (
+                packet.cc == CommandCodes.POWER
+                and packet.data == bytes([0x01])
+                and self._state.get(CommandCodes.POWER) == bytes([0x00])
+            ):
+                self._woke_at = _monotonic()
             self._state[packet.cc] = packet.data
         else:
             self._state[packet.cc] = None
@@ -529,7 +560,12 @@ class State:
         return await self._send_rc5_code(self.get_rc5code(table, value))
 
     async def _send_rc5_expecting(
-        self, table: dict, value, cc: CommandCodes, expected: bytes
+        self,
+        table: dict,
+        value,
+        cc: CommandCodes,
+        expected: bytes | Collection[bytes],
+        timeout: timedelta | None = None,
     ) -> None:
         """Send an RC5 command and confirm the zone reports ``expected`` for ``cc``.
 
@@ -537,10 +573,14 @@ class State:
         without echoing the simulate-IR frame; only the resulting status push
         follows. Without an echo, wait for that push (or read the value), and
         raise TimeoutError if the zone never reports the expected state.
+        ``expected`` is one value or several that each confirm it, and
+        ``timeout`` defaults to _CONFIRM_TIMEOUT.
         """
         if await self._send_rc5(table, value):
             return
-        if not await self._wait_for(cc, expected, _CONFIRM_TIMEOUT):
+        if timeout is None:
+            timeout = _CONFIRM_TIMEOUT
+        if not await self._wait_for(cc, expected, timeout):
             raise TimeoutError(f"Zone {self._zn} did not report {cc.name} as expected")
 
     def get(self, cc):
@@ -580,7 +620,7 @@ class State:
             RC5CODE_DECODE_MODE_2CH,
             mode,
             CommandCodes.DECODE_MODE_STATUS_2CH,
-            bytes([int(mode)]),
+            _decode_mode_confirmations(mode),
         )
 
     def get_decode_mode_mch(self) -> DecodeModeMCH | None:
@@ -594,7 +634,7 @@ class State:
             RC5CODE_DECODE_MODE_MCH,
             mode,
             CommandCodes.DECODE_MODE_STATUS_MCH,
-            bytes([int(mode)]),
+            _decode_mode_confirmations(mode),
         )
 
     def get_2ch(self) -> bool:
@@ -660,7 +700,11 @@ class State:
         else:
             if power:
                 await self._send_rc5_expecting(
-                    RC5CODE_POWER, power, CommandCodes.POWER, bytes([0x01])
+                    RC5CODE_POWER,
+                    power,
+                    CommandCodes.POWER,
+                    bytes([0x01]),
+                    _POWER_ON_TIMEOUT,
                 )
             else:
                 # seed with a response, since device might not
@@ -949,9 +993,11 @@ class State:
         """Select a source, powering the zone on first if it is in standby.
 
         A zone that is waking up can drop the command, so it is sent again
-        until the zone reports the source, up to _SOURCE_ATTEMPTS times.
-        Raises TimeoutError if the zone never reports it, and ValueError for
-        a source this model does not have, before anything is sent.
+        until the zone reports the source: up to _SOURCE_ATTEMPTS times, and
+        for as long as the zone may still be waking, which is until
+        _SOURCE_WAKE_TIME after it reported power on. Raises TimeoutError if
+        the zone never reports it, and ValueError for a source this model
+        does not have, before anything is sent.
         """
         expected = src.to_bytes(self._api_model, self._zn)
         if self._api_model not in SOURCE_WRITE_SUPPORTED:
@@ -960,7 +1006,7 @@ class State:
         if self.get_power() is False:
             await self._power_on_for_source()
 
-        for attempt in range(1, _SOURCE_ATTEMPTS + 1):
+        for attempt in itertools.count(1):
             await self._send_source(src)
             if await self._wait_for(
                 CommandCodes.CURRENT_SOURCE, expected, _CONFIRM_TIMEOUT
@@ -970,18 +1016,31 @@ class State:
                 "Zone %s has not switched to %s after attempt %s",
                 self._zn, src.name, attempt,
             )
+            if attempt >= _SOURCE_ATTEMPTS and not self._waking():
+                break
         _LOGGER.warning("Zone %s did not switch to %s", self._zn, src.name)
         raise TimeoutError(f"Zone {self._zn} did not switch to {src.name}")
+
+    def _waking(self) -> bool:
+        """Whether the zone reported power on too recently to have finished waking."""
+        return (
+            self._woke_at is not None
+            and _monotonic() - self._woke_at < _SOURCE_WAKE_TIME.total_seconds()
+        )
 
     async def _power_on_for_source(self) -> None:
         """Power the zone on and wait for it to say so, before a source is sent."""
         try:
             await self.set_power(True)
+            # After an unechoed RC5 power-on, set_power has already waited for
+            # the report and this returns at once. It matters after a direct
+            # power write or an echoed RC5 code.
+            on = await self._wait_for(
+                CommandCodes.POWER, bytes([0x01]), _POWER_ON_TIMEOUT
+            )
         except TimeoutError:
-            pass  # a zone that is still waking up reports it a little later
-        if not await self._wait_for(
-            CommandCodes.POWER, bytes([0x01]), _SOURCE_POWER_ON_TIMEOUT
-        ):
+            on = False
+        if not on:
             _LOGGER.warning(
                 "Zone %s did not report power on; selecting the source anyway",
                 self._zn,
@@ -1001,18 +1060,22 @@ class State:
         await self._send_rc5(RC5CODE_SOURCE, src)
 
     async def _wait_for(
-        self, cc: CommandCodes, expected: bytes, timeout: timedelta
+        self,
+        cc: CommandCodes,
+        expected: bytes | Collection[bytes],
+        timeout: timedelta,
     ) -> bool:
         """Wait for the zone to report ``expected`` for ``cc``.
 
-        A status message normally arrives well within the timeout. If none
-        has, the value is read once before giving up: the unit sends its
-        feedback to whichever client made the latest request, which need not
-        be this one.
+        ``expected`` is one value, or several that each count. A status
+        message normally arrives well within the timeout. If none has, the
+        value is read once before giving up: the unit sends its feedback to
+        whichever client made the latest request, which need not be this one.
         """
+        accepted = (expected,) if isinstance(expected, bytes) else tuple(expected)
         try:
             async with asyncio.timeout(timeout.total_seconds()):
-                while self._state.get(cc) != expected:
+                while self._state.get(cc) not in accepted:
                     self._changed.clear()
                     await self._changed.wait()
             return True
@@ -1023,7 +1086,7 @@ class State:
         except (ResponseException, TimeoutError) as e:
             _LOGGER.debug("Could not read %s: %r", cc, e)
             return False
-        return self._state[cc] == expected
+        return self._state[cc] in accepted
 
     def get_volume(self) -> int | None:
         return _get_byte(self._state.get(CommandCodes.VOLUME))
