@@ -1,4 +1,6 @@
 """Tests for JBL Synthesis (SDR-35/SDR-38/SDP-55/SDP-58) support."""
+from datetime import timedelta
+
 import pytest
 from unittest.mock import MagicMock
 
@@ -294,13 +296,15 @@ async def test_mute_rc5_without_echo(mute, status, confirmed):
         (lambda s: s.set_power(False), CommandCodes.POWER, bytes([0x00]), True),
     ],
 )
-async def test_rc5_commands_without_echo(action, cc, status, confirmed):
+async def test_rc5_commands_without_echo(action, cc, status, confirmed, monkeypatch):
     """RC5-simulated commands must not fail when only the status push answers.
 
     Same firmware behaviour as mute, observed on an SDR-35 for input
     selection as well: the command executes but the 0x08 frame is never
     echoed.
     """
+    # No push arrives here; go straight to the read-back.
+    monkeypatch.setattr("arcam.fmj.state._SOURCE_CONFIRM_TIMEOUT", timedelta(0))
     state = make_state("SDR-35")
 
     async def request(zn, command, data, priority=0):
