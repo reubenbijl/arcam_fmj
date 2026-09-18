@@ -110,6 +110,31 @@ async def test_rc5_command_is_sent_once_when_not_echoed(server, client, mocker):
     assert received == [bytes([0x10, 0x10])]
 
 
+async def test_volume_step_is_one_direct_write(server, client):
+    writes = []
+    rc5 = []
+
+    def volume(zn, cc, data):
+        writes.append(data[0])
+        return bytes([data[0]])
+
+    def simulate(zn, cc, data):
+        rc5.append(bytes(data))
+        return []
+
+    # The server fixture answers the 0xF0 read with 0x01.
+    server.register_handler(0x01, CommandCodes.VOLUME, None, volume)
+    server.register_handler(0x01, CommandCodes.SIMULATE_RC5_IR_COMMAND, None, simulate)
+    state = State(client, 0x01)
+    state._amxduet = AmxDuetResponse({"Device-Model": "SDR-35"})
+
+    await state.inc_volume()
+
+    assert writes == [0x02]
+    assert rc5 == []
+    assert state.get_volume() == 0x02
+
+
 async def test_silent_server_request(speedy_client, silent_server, client):
     with pytest.raises(asyncio.TimeoutError):
         await client.request(0x01, CommandCodes.POWER, bytes([0xF0]))

@@ -250,6 +250,7 @@ class State:
         self._updated = asyncio.Event()
         # Set whenever a status message for this zone is recorded.
         self._changed = asyncio.Event()
+        self._volume_lock = asyncio.Lock()
         # Update pacing, see _due_commands: the connection the cache belongs
         # to, when each tier is next due, and the power and source seen by the
         # previous pass, so that a change brings every tier forward.
@@ -1031,16 +1032,45 @@ class State:
         await self._request(self._zn, CommandCodes.VOLUME, bytes([volume]))
 
     async def inc_volume(self) -> None:
-        if self._api_model in VOLUME_STEP_SUPPORTED:
-            await self._request(self._zn, CommandCodes.VOLUME, bytes([0xF1]))
-        else:
-            await self._send_rc5(RC5CODE_VOLUME, True)
+        await self._step_volume(True)
 
     async def dec_volume(self) -> None:
+        await self._step_volume(False)
+
+    async def _step_volume(self, up: bool) -> None:
+        """Move the volume one step up or down.
+
+        Written as an absolute value, the current volume plus or minus one,
+        which is how every vendor driver for these units steps it: the unit
+        answers the write with the new value, so the step is exact and safe
+        to retry. The RC5 volume codes are not echoed, and one re-sent after
+        a timeout stepped the volume twice (measured on an SDR-35). The
+        current volume is read first, since the cached one can be stale when
+        another controller has changed it. Steps run one at a time, so quick
+        presses each move from the last. Only while the volume is unknown is
+        a single RC5 step sent instead.
+        """
         if self._api_model in VOLUME_STEP_SUPPORTED:
-            await self._request(self._zn, CommandCodes.VOLUME, bytes([0xF2]))
-        else:
-            await self._send_rc5(RC5CODE_VOLUME, False)
+            await self._request(
+                self._zn, CommandCodes.VOLUME, bytes([0xF1 if up else 0xF2])
+            )
+            return
+        async with self._volume_lock:
+            try:
+                self._state[CommandCodes.VOLUME] = await self._request(
+                    self._zn, CommandCodes.VOLUME, bytes([0xF0])
+                )
+            except (ResponseException, TimeoutError) as e:
+                _LOGGER.debug("Could not read the volume before a step: %r", e)
+            current = self.get_volume()
+            if current is None:
+                await self._send_rc5(RC5CODE_VOLUME, up)
+                return
+            target = min(current + 1, 99) if up else max(current - 1, 0)
+            if target != current:
+                self._state[CommandCodes.VOLUME] = await self._request(
+                    self._zn, CommandCodes.VOLUME, bytes([target])
+                )
 
     def get_dab_station(self) -> str | None:
         if not self._is_command_supported_on_source(CommandCodes.DAB_STATION):

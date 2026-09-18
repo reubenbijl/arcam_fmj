@@ -1,4 +1,5 @@
 """Tests for JBL Synthesis (SDR-35/SDR-38/SDP-55/SDP-58) support."""
+import asyncio
 from datetime import timedelta
 
 import pytest
@@ -300,6 +301,114 @@ async def test_unechoed_rc5_without_expectation_is_not_an_error():
     await state.send_navigation(RC5CodeNavigation.UP)
     await state.send_numeric(1)
     assert state.client.request.call_count == 2
+
+
+# --- Volume steps ----------------------------------------------------------
+
+
+class FakeVolume:
+    """Answers VOLUME reads and writes like the unit; any RC5 is recorded."""
+
+    def __init__(self, state: State, volume: int | None) -> None:
+        self.state = state
+        self.volume = volume
+        self.writes: list[int] = []
+        self.rc5: list[bytes] = []
+        state.client.request.side_effect = self.request
+
+    async def request(self, zn, cc, data, priority=0):
+        if cc == CommandCodes.SIMULATE_RC5_IR_COMMAND:
+            self.rc5.append(bytes(data))
+            raise TimeoutError  # never echoed
+        assert cc == CommandCodes.VOLUME
+        if data == bytes([0xF0]):
+            if self.volume is None:
+                raise TimeoutError
+            return bytes([self.volume])
+        self.volume = data[0]
+        self.writes.append(data[0])
+        return bytes([self.volume])
+
+
+@pytest.mark.parametrize(
+    ("volume", "up", "writes", "after"),
+    [
+        (61, True, [62], 62),
+        (61, False, [60], 60),
+        (99, True, [], 99),
+        (0, False, [], 0),
+    ],
+)
+async def test_volume_step_writes_an_absolute_value(volume, up, writes, after):
+    """One step is one unit, written directly: exact, echoed, never RC5.
+
+    On an SDR-35 one RC5 volume step, re-sent after a timeout because the
+    unit never echoes RC5, moved the volume two units.
+    """
+    state = make_state("SDR-35")
+    unit = FakeVolume(state, volume)
+
+    await (state.inc_volume() if up else state.dec_volume())
+
+    assert unit.writes == writes
+    assert unit.rc5 == []
+    assert state.get_volume() == after
+
+
+async def test_volume_step_reads_the_current_volume_first():
+    """Another controller may have moved it since the last push reached us."""
+    state = make_state("SDR-35")
+    state._state[CommandCodes.VOLUME] = bytes([40])  # stale
+    unit = FakeVolume(state, 61)
+
+    await state.inc_volume()
+
+    assert unit.writes == [62]
+
+
+async def test_volume_steps_run_one_after_another():
+    state = make_state("SDR-35")
+    unit = FakeVolume(state, 61)
+
+    await asyncio.gather(state.inc_volume(), state.inc_volume())
+
+    assert unit.writes == [62, 63]
+
+
+async def test_volume_step_uses_the_cached_value_when_the_read_fails():
+    state = make_state("SDR-35")
+    state._state[CommandCodes.VOLUME] = bytes([61])
+    unit = FakeVolume(state, None)  # reads time out
+
+    await state.inc_volume()
+
+    assert unit.writes == [62]
+    assert unit.rc5 == []
+
+
+async def test_volume_step_falls_back_to_one_rc5_step_when_unknown():
+    state = make_state("SDR-35")
+    unit = FakeVolume(state, None)
+
+    await state.dec_volume()
+
+    assert unit.writes == []
+    assert unit.rc5 == [bytes([16, 17])]
+
+
+async def test_volume_step_on_st_series_uses_the_step_command():
+    """The ST60 steps with 0xF1/0xF2 on 0x0D, which it echoes."""
+    client = MagicMock(spec=Client)
+    state = State(client, 1)
+    state._amxduet = AmxDuetResponse({"Device-Model": "ST60"})
+
+    await state.inc_volume()
+    await state.dec_volume()
+
+    assert [call.args[2] for call in client.request.call_args_list] == [
+        bytes([0xF1]),
+        bytes([0xF2]),
+    ]
 
 
 @pytest.mark.parametrize(
