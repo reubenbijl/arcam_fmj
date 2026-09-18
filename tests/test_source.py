@@ -133,7 +133,7 @@ HDA = ApiModel.APIHDA_SERIES
 @pytest.fixture
 def no_wait(monkeypatch):
     """Stop waiting for status pushes at once, so each wait ends in a read."""
-    monkeypatch.setattr("arcam.fmj.state._SOURCE_CONFIRM_TIMEOUT", timedelta(0))
+    monkeypatch.setattr("arcam.fmj.state._CONFIRM_TIMEOUT", timedelta(0))
     monkeypatch.setattr("arcam.fmj.state._SOURCE_POWER_ON_TIMEOUT", timedelta(0))
 
 

@@ -6,7 +6,9 @@ import pytest
 from datetime import timedelta
 
 from arcam.fmj.utils import cancel_and_wait
+from arcam.fmj.codecs import AnswerCodes
 from arcam.fmj.commands import CommandCodes
+from arcam.fmj.packets import AmxDuetResponse, ResponsePacket
 from arcam.fmj.errors import (
     CommandNotRecognised,
     ConnectionFailed,
@@ -87,6 +89,25 @@ async def test_state(server, client):
     await asyncio.gather(*await state.get_update_tasks())
     assert state.get(CommandCodes.POWER) == bytes([0x00])
     assert state.get(CommandCodes.VOLUME) == bytes([0x01])
+
+
+async def test_rc5_command_is_sent_once_when_not_echoed(server, client, mocker):
+    """An SDR-35 answers a simulated RC5 command only with the status message
+    its effect causes. Re-sending it after the timeout stepped the volume twice
+    on the real unit, so it must go out exactly once."""
+    mocker.patch("arcam.fmj.client._RC5_ECHO_WINDOW", new=timedelta(milliseconds=100))
+    received = []
+
+    def rc5(zn, cc, data):
+        received.append(bytes(data))
+        return [ResponsePacket(zn, CommandCodes.VOLUME, AnswerCodes.STATUS_UPDATE, bytes([62]))]
+
+    server.register_handler(0x01, CommandCodes.SIMULATE_RC5_IR_COMMAND, None, rc5)
+    with pytest.raises(TimeoutError):
+        await client.request(0x01, CommandCodes.SIMULATE_RC5_IR_COMMAND, bytes([0x10, 0x10]))
+    # A re-send would follow straight after the echo window.
+    await asyncio.sleep(0.3)
+    assert received == [bytes([0x10, 0x10])]
 
 
 async def test_silent_server_request(speedy_client, silent_server, client):

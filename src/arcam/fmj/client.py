@@ -32,15 +32,22 @@ from .utils import async_retry, cancel_and_wait, run_tasks
 
 _LOGGER = logging.getLogger(__name__)
 
-# 1.2s, not 500ms: the SDR-35 answers some requests just over half a second,
-# and never echoes the 0x08 frame for RC5-simulated commands at all - only a
-# status push about 0.6s later. At 500ms those all timed out and were re-sent
-# by @async_retry, which cost two transmissions and ~1.1s to get an answer a
-# single longer wait gets in one. Slower than the old worst case only when the
-# device is genuinely unresponsive.
+# 1.2s, not 500ms: the SDR-35 answers some requests just over half a second.
+# At 500ms those timed out and were re-sent by @async_retry, which cost two
+# transmissions and ~1.1s to get an answer a single longer wait gets in one.
+# Slower than the old worst case only when the device is genuinely
+# unresponsive.
 _REQUEST_TIMEOUT = timedelta(milliseconds=1200)
 _REQUEST_RETRY_COUNT = 2
 _REQUEST_SETTLE_TIME = timedelta(milliseconds=5)
+
+# A simulated RC5 command (0x08) is carried out but not always echoed: the
+# SDR-35 never echoes one, and only the status message the command causes
+# follows (within about 70ms for volume, measured). So it is sent exactly once:
+# re-sending volume up after a timeout stepped the volume twice, measured on
+# an SDR-35. The send queue waits this long for an echo before moving on; the
+# JBL vendor drivers wait 250-500ms and never re-send either.
+_RC5_ECHO_WINDOW = timedelta(milliseconds=500)
 
 _UPDATE_IDLE_INTERVAL = timedelta(milliseconds=200)
 
@@ -50,6 +57,13 @@ _HEARTBEAT_TIMEOUT = _HEARTBEAT_INTERVAL + _HEARTBEAT_INTERVAL
 _USER_PRIORITY = 0
 _UPDATE_PRIORITY = 10
 _HEARTBEAT_PRIORITY = 100
+
+def _is_rc5(packet: CommandPacket | AmxDuetRequest) -> bool:
+    return (
+        isinstance(packet, CommandPacket)
+        and packet.cc == CommandCodes.SIMULATE_RC5_IR_COMMAND
+    )
+
 
 #: A coroutine that fetches one piece of device state.
 UpdateTask = Coroutine[Any, Any, None]
@@ -189,12 +203,13 @@ class ClientBase:
             for listener in self._listen:
                 listener(packet)
 
-    @async_retry(_REQUEST_RETRY_COUNT, TimeoutError)
-    async def _write_and_wait(
+    async def _send_and_wait(
         self,
         writer: StreamWriter,
         packet: CommandPacket | AmxDuetRequest,
+        timeout: timedelta,
     ) -> ResponsePacket | AmxDuetResponse:
+        """Send a packet once and wait up to ``timeout`` for its answer."""
         future: asyncio.Future[ResponsePacket | AmxDuetResponse] = (
             asyncio.get_running_loop().create_future()
         )
@@ -206,8 +221,16 @@ class ClientBase:
         _LOGGER.debug("Sending %s", packet)
         with self.listen(listen):
             await write_packet(writer, packet)
-            async with asyncio.timeout(_REQUEST_TIMEOUT.total_seconds()):
+            async with asyncio.timeout(timeout.total_seconds()):
                 return await future
+
+    @async_retry(_REQUEST_RETRY_COUNT, TimeoutError)
+    async def _write_and_wait(
+        self,
+        writer: StreamWriter,
+        packet: CommandPacket | AmxDuetRequest,
+    ) -> ResponsePacket | AmxDuetResponse:
+        return await self._send_and_wait(writer, packet, _REQUEST_TIMEOUT)
 
     async def _process_send(self, writer: StreamWriter):
         try:
@@ -215,7 +238,13 @@ class ClientBase:
                 item = await self._queue.get()
                 try:
                     try:
-                        response = await self._write_and_wait(writer, item.packet)
+                        if _is_rc5(item.packet):
+                            # Never re-sent: see _RC5_ECHO_WINDOW.
+                            response = await self._send_and_wait(
+                                writer, item.packet, _RC5_ECHO_WINDOW
+                            )
+                        else:
+                            response = await self._write_and_wait(writer, item.packet)
                     except TimeoutError as e:
                         if not item.future.done():
                             item.future.set_exception(e)

@@ -191,6 +191,10 @@ def _monotonic() -> float:
     """Seconds on the clock the update pacing runs on; replaced in tests."""
     return time.monotonic()
 
+#: How long a command waits for the zone to report its effect, when the unit
+#: does not echo the command itself (simulated RC5 on an SDR-35).
+_CONFIRM_TIMEOUT = timedelta(seconds=2)
+
 # --- Source selection ---
 #
 # A zone that is waking up can drop a source command, so every vendor driver
@@ -200,8 +204,6 @@ def _monotonic() -> float:
 
 #: How long a zone in standby gets to report that it is on.
 _SOURCE_POWER_ON_TIMEOUT = timedelta(seconds=15)
-#: How long each attempt waits for the zone to report the new source.
-_SOURCE_CONFIRM_TIMEOUT = timedelta(seconds=2)
 #: Source commands sent before giving up.
 _SOURCE_ATTEMPTS = 3
 
@@ -506,30 +508,39 @@ class State:
             )
         return command
 
-    async def _send_rc5(self, table: dict, value) -> None:
-        command = self.get_rc5code(table, value)
-        await self._request(
-            self._zn, CommandCodes.SIMULATE_RC5_IR_COMMAND, command
-        )
+    async def _send_rc5_code(self, code: bytes) -> bool:
+        """Send one simulated RC5 command and return whether it was echoed.
+
+        No echo is normal: the SDR-35 carries every RC5 command out without
+        echoing it, and the status message the command causes is the only
+        confirmation. The client never sends an RC5 frame twice, since a
+        repeated relative code (volume, a tone step, a toggle) would act twice.
+        """
+        try:
+            await self._request(
+                self._zn, CommandCodes.SIMULATE_RC5_IR_COMMAND, code
+            )
+        except TimeoutError:
+            return False
+        return True
+
+    async def _send_rc5(self, table: dict, value) -> bool:
+        return await self._send_rc5_code(self.get_rc5code(table, value))
 
     async def _send_rc5_expecting(
         self, table: dict, value, cc: CommandCodes, expected: bytes
     ) -> None:
-        """Send an RC5 command, tolerating firmware that skips the 0x08 echo.
+        """Send an RC5 command and confirm the zone reports ``expected`` for ``cc``.
 
-        The SDR-35 executes several RC5 codes (mute, source, decode mode,
-        power) without echoing the simulate-IR frame; only the resulting
-        status push follows, observed well under a second later. On timeout,
-        confirm the target state actually landed before failing a command
-        that in fact worked.
+        The SDR-35 executes RC5 codes (mute, source, decode mode, power)
+        without echoing the simulate-IR frame; only the resulting status push
+        follows. Without an echo, wait for that push (or read the value), and
+        raise TimeoutError if the zone never reports the expected state.
         """
-        try:
-            await self._send_rc5(table, value)
-        except TimeoutError:
-            data = await self._request(self._zn, cc, bytes([0xF0]))
-            self._state[cc] = data
-            if data != expected:
-                raise
+        if await self._send_rc5(table, value):
+            return
+        if not await self._wait_for(cc, expected, _CONFIRM_TIMEOUT):
+            raise TimeoutError(f"Zone {self._zn} did not report {cc.name} as expected")
 
     def get(self, cc):
         return self._state[cc]
@@ -951,7 +962,7 @@ class State:
         for attempt in range(1, _SOURCE_ATTEMPTS + 1):
             await self._send_source(src)
             if await self._wait_for(
-                CommandCodes.CURRENT_SOURCE, expected, _SOURCE_CONFIRM_TIMEOUT
+                CommandCodes.CURRENT_SOURCE, expected, _CONFIRM_TIMEOUT
             ):
                 return
             _LOGGER.debug(
@@ -984,12 +995,9 @@ class State:
                 src.to_bytes(self._api_model, self._zn),
             )
             return
-        try:
-            await self._send_rc5(RC5CODE_SOURCE, src)
-        except TimeoutError:
-            # This firmware does not always echo a simulated RC5 command; the
-            # status message that follows is what confirms it.
-            pass
+        # Not echoed by this firmware: the status message that follows is
+        # what confirms it.
+        await self._send_rc5(RC5CODE_SOURCE, src)
 
     async def _wait_for(
         self, cc: CommandCodes, expected: bytes, timeout: timedelta
@@ -1095,9 +1103,7 @@ class State:
             raise ValueError(
                 f"Numeric RC5 not supported on {self.model}"
             )
-        await self._request(
-            self._zn, CommandCodes.SIMULATE_RC5_IR_COMMAND, bytes([0x10, digit])
-        )
+        await self._send_rc5_code(bytes([0x10, digit]))
 
     async def send_color(self, color: RC5CodeColor) -> None:
         await self._send_rc5(RC5CODE_COLOR, color)

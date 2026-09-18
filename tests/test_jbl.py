@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 from arcam.fmj.client import Client
 from arcam.fmj.codecs import (
+    AnswerCodes,
     CompressionMode,
     ControlOption,
     DecodeMode2CH,
@@ -24,7 +25,8 @@ from arcam.fmj.codecs import (
 )
 from arcam.fmj.commands import CommandCodes
 from arcam.fmj.models import ApiModel, api_model_for
-from arcam.fmj.packets import AmxDuetResponse
+from arcam.fmj.packets import AmxDuetResponse, ResponsePacket
+from arcam.fmj.rc5 import RC5CodeNavigation
 from arcam.fmj.state import State
 
 # 2ch and multi-channel incoming formats, to steer State.get_2ch()
@@ -241,13 +243,15 @@ async def test_multichannel_pcm_is_not_2ch():
         (True, bytes([0x01]), False),
     ],
 )
-async def test_mute_rc5_without_echo(mute, status, confirmed):
+async def test_mute_rc5_without_echo(mute, status, confirmed, monkeypatch):
     """Mute must not fail when only the status push answers.
 
     Observed on an SDR-35: the discrete mute RC5 codes are executed but the
     0x08 frame is never echoed, so the request times out while the 0x0E
     status arrives as a push.
     """
+    # No push arrives here; go straight to the read-back.
+    monkeypatch.setattr("arcam.fmj.state._CONFIRM_TIMEOUT", timedelta(0))
     state = make_state("SDR-35")
 
     async def request(zn, cc, data, priority=0):
@@ -263,6 +267,39 @@ async def test_mute_rc5_without_echo(mute, status, confirmed):
     else:
         with pytest.raises(TimeoutError):
             await state.set_mute(mute)
+
+
+async def test_rc5_confirmed_by_the_status_push_without_a_read():
+    """The push the command causes is the confirmation; no read is needed."""
+    state = make_state("SDR-35")
+    requests = []
+
+    async def request(zn, cc, data, priority=0):
+        requests.append(cc)
+        if cc == CommandCodes.SIMULATE_RC5_IR_COMMAND:
+            state._listen(
+                ResponsePacket(zn, CommandCodes.MUTE, AnswerCodes.STATUS_UPDATE, bytes([0x00]))
+            )
+            raise TimeoutError  # carried out, never echoed
+        raise AssertionError(f"unexpected request {cc}")
+
+    state.client.request.side_effect = request
+    await state.set_mute(True)
+    assert state.get_mute() is True
+    assert requests == [CommandCodes.SIMULATE_RC5_IR_COMMAND]
+
+
+async def test_unechoed_rc5_without_expectation_is_not_an_error():
+    """A command with no state to confirm returns once it has been sent."""
+    state = make_state("SDR-35")
+
+    async def request(zn, cc, data, priority=0):
+        raise TimeoutError  # never echoed
+
+    state.client.request.side_effect = request
+    await state.send_navigation(RC5CodeNavigation.UP)
+    await state.send_numeric(1)
+    assert state.client.request.call_count == 2
 
 
 @pytest.mark.parametrize(
@@ -304,7 +341,7 @@ async def test_rc5_commands_without_echo(action, cc, status, confirmed, monkeypa
     echoed.
     """
     # No push arrives here; go straight to the read-back.
-    monkeypatch.setattr("arcam.fmj.state._SOURCE_CONFIRM_TIMEOUT", timedelta(0))
+    monkeypatch.setattr("arcam.fmj.state._CONFIRM_TIMEOUT", timedelta(0))
     state = make_state("SDR-35")
 
     async def request(zn, command, data, priority=0):
