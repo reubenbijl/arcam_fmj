@@ -1,7 +1,10 @@
 """Zone state"""
 
 import asyncio
+import enum
 import logging
+import time
+from datetime import timedelta
 from typing import Any, TypeVar
 
 import attr
@@ -112,6 +115,80 @@ _TWO_CHANNEL_CONFIGS = {
     IncomingAudioConfig.UNDETECTED,
 }
 
+# --- Update pacing ---
+#
+# The unit pushes a status message for every change made with its front panel
+# or remote (SH289E "State changes as a result of other inputs"), so most state
+# needs no polling at all. Two kinds still do:
+#
+# - what the unit never pushes: network and Bluetooth playback (the NOT_PUSHED
+#   flag), and the incoming stream. SH289E only promises pushes for changes a
+#   user makes, not for a new signal arriving, and the decode mode that applies
+#   switches with the stream too;
+# - everything else, as a safety net: the unit sends its feedback to whichever
+#   client made the most recent request (JBL's RTI driver documentation), so a
+#   push can go to the JBL app or the unit's web page instead of here.
+#
+# The vendor drivers for these units all pace their polling this way, re-reading
+# a small core set every few tens of seconds and the rest about once a minute.
+# Re-reading everything back to back instead keeps the unit busy and makes this
+# client the one that receives every other client's feedback.
+
+
+class _PollTier(enum.Enum):
+    """How often the update loop re-reads a command."""
+
+    FAST = enum.auto()
+    CORE = enum.auto()
+    SLOW = enum.auto()
+
+
+_POLL_INTERVALS = {
+    _PollTier.FAST: timedelta(seconds=5),
+    _PollTier.CORE: timedelta(seconds=30),
+    _PollTier.SLOW: timedelta(seconds=60),
+}
+
+#: A zone that has just powered on answers some requests with errors while it
+#: boots, so everything is read once more after this settling time.
+_POLL_POWER_ON_SETTLE = timedelta(seconds=10)
+
+_POLL_CORE_COMMANDS = frozenset({
+    CommandCodes.POWER,
+    CommandCodes.VOLUME,
+    CommandCodes.MUTE,
+    CommandCodes.CURRENT_SOURCE,
+})
+
+#: The incoming stream, and the decode mode read back for it.
+_POLL_STREAM_COMMANDS = frozenset({
+    CommandCodes.DECODE_MODE_STATUS_2CH,
+    CommandCodes.DECODE_MODE_STATUS_MCH,
+    CommandCodes.GENERAL_SETUP,
+    CommandCodes.INCOMING_VIDEO_PARAMETERS,
+    CommandCodes.INCOMING_AUDIO_FORMAT,
+    CommandCodes.INCOMING_AUDIO_SAMPLE_RATE,
+})
+
+#: Fixed for the life of a connection: read until the unit gives an answer,
+#: then not again until the next connection.
+_POLL_ONCE_COMMANDS = frozenset({
+    CommandCodes.ROOM_EQ_NAMES,
+    CommandCodes.SOFTWARE_VERSION,
+})
+
+
+def _poll_tier(cc: CommandCodes) -> _PollTier:
+    if cc.flags & CommandFlags.NOT_PUSHED or cc in _POLL_STREAM_COMMANDS:
+        return _PollTier.FAST
+    if cc in _POLL_CORE_COMMANDS:
+        return _PollTier.CORE
+    return _PollTier.SLOW
+
+
+def _monotonic() -> float:
+    """Seconds on the clock the update pacing runs on; replaced in tests."""
+    return time.monotonic()
 
 
 def _get_byte(data: bytes | None) -> int | None:
@@ -154,6 +231,13 @@ class State:
         self._amxduet: AmxDuetResponse | None = None
         self._unsupported_commands: set[CommandCodes] = set()
         self._updated = asyncio.Event()
+        # Update pacing, see _due_commands: the connection the cache belongs
+        # to, when each tier is next due, and the power and source seen by the
+        # previous pass, so that a change brings every tier forward.
+        self._poll_connection: int | None = None
+        self._poll_due: dict[_PollTier, float] = {}
+        self._poll_power: bool | None = None
+        self._poll_source: SourceCodes | None = None
 
     async def start(self) -> None:
         # pylint: disable=protected-access
@@ -266,19 +350,101 @@ class State:
         return src is None or src in cc.sources
 
     def _should_update(self, cc: CommandCodes) -> bool:
-        """Whether the update loop should fetch this command right now."""
+        """Whether the update loop may fetch this command in the current state.
+
+        When it is due is decided by the polling tiers in _due_commands.
+        """
         if not self._is_command_supported(cc):
             return False
         if not (cc.flags & CommandFlags.ZONE_SUPPORT) and self._zn != 1:
             return False
         if not (cc.flags & CommandFlags.UPDATE):
             return False
-        # Pushed commands are fetched only during the initial pass.
-        if not (cc.flags & CommandFlags.NOT_PUSHED) and self._updated.is_set():
-            return False
         if not self._is_command_supported_on_source(cc):
             return False
         return True
+
+    def _forget_connection(self) -> None:
+        """Drop what was learnt on a previous connection, for a fresh first pass."""
+        self._state = dict()
+        self._now_playing = None
+        self._updated.clear()
+        self._poll_due = {}
+        self._poll_power = None
+        self._poll_source = None
+
+    def _due_commands(self) -> tuple[list[CommandCodes], set[_PollTier], bool]:
+        """Pick the commands to read on this pass of the update loop.
+
+        Returns the commands, the tiers they were picked for, and whether this
+        pass follows a power-on (the tiers then come round again after the
+        settling time rather than their usual interval).
+
+        The first pass on a connection reads everything, and so does the pass
+        after the zone powers on or changes source: per-input settings such as
+        tone and room EQ follow the source, and source-specific information
+        starts to apply. Otherwise each tier is read when its interval has
+        passed, and a zone in standby reads nothing but its power.
+        """
+        now = _monotonic()
+        power = self.get_power()
+        source = self.get_source()
+        first_pass = not self._updated.is_set()
+        powered_on = power is True and self._poll_power is False
+        source_changed = (
+            source is not None
+            and self._poll_source is not None
+            and source != self._poll_source
+        )
+        # An unknown value keeps the last known one, so a change is still
+        # noticed after a read that failed in between.
+        if power is not None:
+            self._poll_power = power
+        if source is not None:
+            self._poll_source = source
+
+        refresh = first_pass or powered_on or source_changed
+        if refresh:
+            due = set(_PollTier)
+        else:
+            due = {
+                tier for tier in _PollTier if now >= self._poll_due.get(tier, 0.0)
+            }
+        if not due:
+            return [], due, powered_on
+
+        commands: list[CommandCodes] = []
+        for cc in CommandCodes:
+            if not self._should_update(cc):
+                continue
+            if power is False and not first_pass and cc != CommandCodes.POWER:
+                continue
+            if cc in _POLL_ONCE_COMMANDS and cc in self._state:
+                continue
+            if cc == CommandCodes.PRESET_DETAIL and not refresh:
+                # Fifty requests, for a list that only changes when the user
+                # stores a preset: read when the tuner is selected, not on the
+                # safety-net cycle.
+                continue
+            if _poll_tier(cc) in due:
+                commands.append(cc)
+        return commands, due, powered_on
+
+    def _finish_pass(self, tiers: set[_PollTier], settle: bool) -> None:
+        """Set when the given tiers are next due, counting from now.
+
+        Also takes the power and source the pass read as the baseline for
+        noticing a change, if none was known yet. A known baseline is left
+        alone, so a change that arrived during the pass is still noticed.
+        """
+        now = _monotonic()
+        for tier in tiers:
+            interval = _POLL_POWER_ON_SETTLE if settle else _POLL_INTERVALS[tier]
+            self._poll_due[tier] = now + interval.total_seconds()
+        if self._poll_power is None:
+            self._poll_power = self.get_power()
+        if self._poll_source is None:
+            self._poll_source = self.get_source()
 
     def _is_value_supported(self, value: Any) -> bool:
         """Check per-value model gating (IntOrTypeEnum.version)."""
@@ -989,48 +1155,51 @@ class State:
                 _LOGGER.debug("Timeout requesting amx")
 
         if not self._client.connected:
-            if self._state:
-                self._state = dict()
-                self._now_playing = None
-            self._updated.clear()
+            self._forget_connection()
             return []
+
+        # The update loop only runs while connected, so a reconnect is noticed
+        # here rather than by a disconnected pass. Whatever was cached before
+        # the first pass arrived on this connection and is kept.
+        connection = self._client.connection_id
+        if self._poll_connection is None:
+            self._poll_connection = connection
+        elif connection != self._poll_connection:
+            self._forget_connection()
+            self._poll_connection = connection
 
         if self._amxduet is None:
             await _update_amxduet()
 
+        first_pass = not self._updated.is_set()
+        commands, due, settle = self._due_commands()
+
         tasks: list[UpdateTask] = []
-        for cc in CommandCodes:
-            if not self._should_update(cc):
-                continue
+        for cc in commands:
             if cc == CommandCodes.NOW_PLAYING_INFO:
                 tasks.append(_update_now_playing())
             elif cc == CommandCodes.PRESET_DETAIL:
                 tasks.append(_update_presets())
-            elif cc == CommandCodes.ROOM_EQ_NAMES:
-                # Static for the life of a connection, and by far the single
-                # largest source of request traffic when polled every pass.
-                # Any settled verdict - data, or None for not-recognised -
-                # is enough; a timeout leaves the key absent and retries.
-                # _state is cleared on disconnect, so this refetches then.
-                if cc not in self._state:
-                    tasks.append(_update(cc))
             else:
                 tasks.append(_update(cc))
 
-        if not self._updated.is_set():
-            if not tasks:
+        if not tasks:
+            self._finish_pass(due, settle)
+            if first_pass:
                 self._updated.set()
-                return []
+            return []
 
-            async def _run_and_signal():
-                try:
-                    await run_tasks(*tasks)
-                finally:
+        async def _run_pass() -> None:
+            try:
+                await run_tasks(*tasks)
+            finally:
+                # Counted from the end of the pass, so a slow unit still gets
+                # a rest between passes.
+                self._finish_pass(due, settle)
+                if first_pass:
                     self._updated.set()
 
-            return [_run_and_signal()]
-
-        return tasks
+        return [_run_pass()]
 
     async def update(self) -> None:
         """Block until the provider-driven update loop completes one pass."""

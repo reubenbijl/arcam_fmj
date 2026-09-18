@@ -1272,11 +1272,11 @@ def test_should_update_pushed_first_pass_polls_even_if_known():
     assert state._should_update(CommandCodes.POWER) is True
 
 
-def test_should_update_pushed_skipped_after_first_pass():
+def test_should_update_leaves_timing_to_the_poll_tiers():
+    """Eligibility only: when a pushed CC is re-read is up to _due_commands."""
     state = State(MagicMock(spec=Client), 1)
     state._updated.set()
-    assert CommandCodes.POWER not in state._state
-    assert state._should_update(CommandCodes.POWER) is False
+    assert state._should_update(CommandCodes.POWER) is True
 
 
 def test_should_update_not_pushed_always_polls():
@@ -1328,16 +1328,31 @@ async def test_update_skips_commands_for_wrong_source():
     assert CommandCodes.POWER in requested
 
 
-async def test_update_pushed_skipped_after_first_pass():
-    """After the initial pass, pushed CCs are no longer requested;
-    NOT_PUSHED ones still are (when source matches)."""
+async def test_update_pushed_skipped_after_first_pass(monkeypatch):
+    """Five seconds after the initial pass, NOT_PUSHED CCs are requested again
+    (when source matches) but pushed ones are not yet."""
+    now = [1000.0]
+    monkeypatch.setattr("arcam.fmj.state._monotonic", lambda: now[0])
     state = _state_at_source(SourceCodes.NET)
     state._amxduet = AmxDuetResponse({"Device-Model": "AVR450"})
-    state._updated.set()
-    tasks = await state.get_update_tasks()
-    await asyncio.gather(*tasks)
+    state._client.connected = True
+    net = SourceCodes.NET.to_bytes(state._api_model, state._zn)
+
+    async def request(zn, cc, data, priority=0):
+        if cc == CommandCodes.POWER:
+            return bytes([0x01])
+        if cc == CommandCodes.CURRENT_SOURCE:
+            return net
+        return bytes([0x00])
+
+    state._client.request.side_effect = request
+    await asyncio.gather(*await state.get_update_tasks())
+
+    state._client.request.reset_mock()
+    now[0] += 5
+    await asyncio.gather(*await state.get_update_tasks())
     requested = [call.args[1] for call in state._client.request.call_args_list]
-    # POWER is pushed — should NOT appear in a post-first-pass batch
+    # POWER is pushed: only the 30 s safety net re-reads it
     assert CommandCodes.POWER not in requested
     # NETWORK_PLAYBACK_STATUS is NOT_PUSHED + source matches — should appear
     assert CommandCodes.NETWORK_PLAYBACK_STATUS in requested

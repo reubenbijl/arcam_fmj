@@ -76,10 +76,21 @@ class ClientBase:
         # Set whenever no connection is up, including before the first start().
         self._disconnected = asyncio.Event()
         self._disconnected.set()
+        self._connection_id: int = 0
 
     @property
     def peer(self) -> str:
         raise NotImplementedError()
+
+    @property
+    def connection_id(self) -> int:
+        """Count of successful start() calls.
+
+        Lets an update provider tell a fresh connection from the one it last
+        polled on: it never sees the gap in between, because the update loop
+        only runs while connected.
+        """
+        return self._connection_id
 
     async def _open(self) -> tuple[StreamReader, StreamWriter]:
         raise NotImplementedError()
@@ -113,6 +124,7 @@ class ClientBase:
         _LOGGER.debug("Connecting to %s", self.peer)
         self._reader, self._writer = await self._open()
         self._queue = asyncio.PriorityQueue()
+        self._connection_id += 1
         self._disconnected.clear()
         _LOGGER.info("Connected to %s", self.peer)
 
