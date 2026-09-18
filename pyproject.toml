@@ -1,6 +1,6 @@
 [project]
 name = "arcam-fmj"
-version = "2.2.1"
+version = "2.2.2"
 description = "A python library for speaking to Arcam receivers"
 readme = "README.rst"
 authors = [
