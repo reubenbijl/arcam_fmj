@@ -19,7 +19,7 @@ from .errors import (
     InvalidPacket,
     NullPacket,
 )
-from .codecs import AnswerCodes
+from .codecs import AnswerCodes, now_playing_echo
 from .commands import CommandCodes
 
 _LOGGER = logging.getLogger(__name__)
@@ -48,7 +48,16 @@ class ResponsePacket:
     def response_to(self, request: Union["AmxDuetRequest", "CommandPacket"]):
         if not isinstance(request, CommandPacket):
             return False
-        return self.zn == request.zn and self.cc == request.cc
+        if self.zn != request.zn or self.cc != request.cc:
+            return False
+        if self.cc == CommandCodes.NOW_PLAYING_INFO and request.data:
+            # Newer firmware names the sub-request an answer belongs to, so an
+            # answer about another field, or an unsolicited update, is not
+            # the reply to this one.
+            echo = now_playing_echo(self.data)
+            if echo is not None and echo != request.data[0]:
+                return False
+        return True
 
     @staticmethod
     def from_bytes(data: bytes) -> "ResponsePacket":

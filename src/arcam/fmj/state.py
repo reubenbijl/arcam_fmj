@@ -35,6 +35,7 @@ from .codecs import (
     SourceCodes,
     VideoParameters,
     VideoSelection,
+    strip_now_playing_echo,
 )
 from .commands import (
     CommandCodes,
@@ -1206,11 +1207,14 @@ class State:
             for field in attr.fields(NowPlayingInfo):
                 if "request" not in field.metadata:
                     continue
+                request = field.metadata["request"]
                 try:
                     data = await self._request(
-                        self._zn, CommandCodes.NOW_PLAYING_INFO, bytes([field.metadata["request"]]), priority
+                        self._zn, CommandCodes.NOW_PLAYING_INFO, bytes([request]), priority
                     )
-                    kwargs[field.name] = field.metadata["converter"](data)
+                    kwargs[field.name] = field.metadata["converter"](
+                        strip_now_playing_echo(request, data)
+                    )
                 except CommandNotRecognised:
                     _LOGGER.debug("Now playing not supported")
                     self._now_playing = None

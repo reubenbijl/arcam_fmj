@@ -20,11 +20,12 @@ from arcam.fmj.codecs import (
     SaveRestoreSubCommand,
     SourceCodes,
     VideoSelection,
+    strip_now_playing_echo,
 )
 from arcam.fmj.commands import CommandCodes, CommandFlags, POWER_WRITE_SUPPORTED
 from arcam.fmj.errors import UnsupportedCommand
 from arcam.fmj.models import ApiModel
-from arcam.fmj.packets import AmxDuetResponse, ResponsePacket
+from arcam.fmj.packets import AmxDuetResponse, CommandPacket, ResponsePacket
 from arcam.fmj.rc5 import (
     RC5CODE_BASS,
     RC5CODE_DISPLAY_BRIGHTNESS,
@@ -846,6 +847,111 @@ async def test_update_now_playing_invalid_sample_rate_and_encoder(data):
     assert info is not None
     assert info.sample_rate is None
     assert info.encoder is None
+
+
+NOTE = "\N{MUSICAL NOTE} Song".encode()  # starts with the 4-byte sequence F0 9F 8E B5
+
+
+@pytest.mark.parametrize(
+    ("request_code", "data", "payload"),
+    [
+        # newer firmware: the requested sub-code comes first
+        (0xF0, b"\xf0Title", b"Title"),
+        (0xF4, b"\xf4\x02", b"\x02"),
+        (0xF5, b"\xf5\x03", b"\x03"),
+        (0xF0, b"\xf0", b""),  # nothing playing
+        (0xF0, b"\xf0" + "é".encode(), "é".encode()),
+        (0xF0, b"\xf0" + NOTE, NOTE),
+        # older firmware: the payload alone
+        (0xF0, b"Title", b"Title"),
+        (0xF4, b"\x02", b"\x02"),
+        (0xF0, NOTE, NOTE),  # an emoji lead byte is not an echo
+        # an echo for another field is not stripped
+        (0xF1, b"\xf0Title", b"\xf0Title"),
+    ],
+)
+def test_strip_now_playing_echo(request_code, data, payload):
+    assert strip_now_playing_echo(request_code, data) == payload
+
+
+@pytest.mark.parametrize(
+    ("replies", "expected"),
+    [
+        (
+            {
+                0xF0: b"\xf0Bohemian Rhapsody",
+                0xF1: b"\xf1Queen",
+                0xF2: b"\xf2A Night at the Opera",
+                0xF3: b"\xf3Spotify",
+                0xF4: b"\xf4\x01",
+                0xF5: b"\xf5\x03",
+            },
+            NowPlayingInfo(
+                track="Bohemian Rhapsody",
+                artist="Queen",
+                album="A Night at the Opera",
+                application="Spotify",
+                sample_rate=44100,
+                encoder=NowPlayingEncoder.FLAC,
+            ),
+        ),
+        (
+            {
+                0xF0: b"Bohemian Rhapsody",
+                0xF1: b"Queen",
+                0xF2: b"A Night at the Opera",
+                0xF3: b"Spotify",
+                0xF4: b"\x01",
+                0xF5: b"\x03",
+            },
+            NowPlayingInfo(
+                track="Bohemian Rhapsody",
+                artist="Queen",
+                album="A Night at the Opera",
+                application="Spotify",
+                sample_rate=44100,
+                encoder=NowPlayingEncoder.FLAC,
+            ),
+        ),
+    ],
+    ids=["echoed", "unechoed"],
+)
+async def test_update_now_playing_with_and_without_echo(replies, expected):
+    client = MagicMock(spec=Client)
+    client.connected = True
+    state = make_state(client, 1, ApiModel.APIHDA_SERIES)
+    net = SourceCodes.NET.to_bytes(state._api_model, state.zn)
+    state._state[CommandCodes.CURRENT_SOURCE] = net
+
+    async def request(zn, cc, data, priority=0):
+        if cc == CommandCodes.NOW_PLAYING_INFO:
+            return replies[data[0]]
+        if cc == CommandCodes.CURRENT_SOURCE:
+            return net
+        return bytes([0x01])
+
+    client.request.side_effect = request
+    await asyncio.gather(*await state.get_update_tasks())
+
+    assert state.get_now_playing() == expected
+
+
+@pytest.mark.parametrize(
+    ("data", "request_code", "matches"),
+    [
+        (b"\xf1Queen", 0xF1, True),
+        (b"\xf0Bohemian Rhapsody", 0xF1, False),  # another field, or a push
+        (b"Queen", 0xF1, True),  # older firmware says nothing either way
+        (NOTE, 0xF1, True),  # an emoji, not an echo
+        (b"", 0xF1, True),  # an error answer carries no data
+    ],
+)
+def test_now_playing_reply_matched_by_its_echo(data, request_code, matches):
+    response = ResponsePacket(
+        1, CommandCodes.NOW_PLAYING_INFO, AnswerCodes.STATUS_UPDATE, data
+    )
+    request = CommandPacket(1, CommandCodes.NOW_PLAYING_INFO, bytes([request_code]))
+    assert response.response_to(request) is matches
 
 
 # --- Bluetooth Status (0x50) ---

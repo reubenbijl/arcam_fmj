@@ -953,6 +953,33 @@ class NowPlayingRequest(IntOrTypeEnum):
     SAMPLE_RATE = 0xF4
     ENCODER = 0xF5
 
+def now_playing_echo(data: bytes) -> int | None:
+    """Return the sub-request code echoed ahead of a 0x64 payload, if any.
+
+    SH289E shows the payload starting at Data1, but newer firmware (from
+    about 2020) sends the requested sub-code there first, which the JBL
+    Crestron, RTI and ELAN drivers all strip; the spec's own example has a
+    data length of 2 for a one-letter answer. Older firmware sends the payload
+    alone, so both forms occur.
+
+    0xF0-0xF4 are also the lead bytes of four-byte UTF-8 characters, so an
+    unechoed title that starts with an emoji starts with one of them too. A
+    character's lead byte is followed by three continuation bytes (0x80-0xBF);
+    an echo never is, because the payload after it starts with a lead byte,
+    plain ASCII or a small enum value.
+    """
+    if not data or not NowPlayingRequest.TRACK <= data[0] <= NowPlayingRequest.ENCODER:
+        return None
+    if data[0] <= 0xF4 and len(data) >= 4 and all(0x80 <= b <= 0xBF for b in data[1:4]):
+        return None
+    return data[0]
+
+def strip_now_playing_echo(request: int, data: bytes) -> bytes:
+    """Return a 0x64 payload without the echoed sub-request code, if present."""
+    if now_playing_echo(data) == request:
+        return data[1:]
+    return data
+
 def _decode_string(data: bytes) -> str:
     """Decode a UTF-8 payload, stripping trailing NUL bytes."""
     return data.decode("utf8", errors="replace").rstrip("\x00")
